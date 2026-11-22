@@ -2,15 +2,36 @@ import CryptoKit
 import CoreTransferable
 import PhotosUI
 import QuickLook
+import QuickLookThumbnailing
 import Security
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 private struct Entry: Decodable, Identifiable {
     let name: String
     let directory: Bool
     let size: Int64
+    let modified: Double?
     var id: String { name }
+    private var fileType: UTType? { UTType(filenameExtension: (name as NSString).pathExtension) }
+
+    var icon: String {
+        if directory { return "folder.fill" }
+        guard let type = fileType else { return "doc" }
+        if type.conforms(to: .image) { return "photo" }
+        if type.conforms(to: .movie) { return "film" }
+        if type.conforms(to: .audio) { return "waveform" }
+        return "doc"
+    }
+
+    var canLoadThumbnail: Bool {
+        guard !directory, size > 0, size <= 12 * 1024 * 1024, let type = fileType else { return false }
+        return type.conforms(to: .image) || type.conforms(to: .pdf) ||
+            type.conforms(to: .movie) || type.conforms(to: .text) ||
+            ["docx", "xlsx", "pptx", "pages", "numbers", "key"].contains(
+                (name as NSString).pathExtension.lowercased())
+    }
 }
 
 private struct ClipboardItem {
@@ -89,6 +110,11 @@ private final class Drive: ObservableObject {
     @Published var clipboard: ClipboardItem?
     private var base: URL?
     private var session: URLSession?
+    private let thumbnails: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.countLimit = 128
+        return cache
+    }()
 
     func login(address: String, fingerprint: String, username: String, password: String) async throws {
         guard let url = URL(string: address.trimmingCharacters(in: .whitespacesAndNewlines)),
@@ -117,6 +143,7 @@ private final class Drive: ObservableObject {
         if let request = try? request("POST", "logout") { _ = try? await send(request) }
         token = nil
         clipboard = nil
+        thumbnails.removeAllObjects()
         session?.invalidateAndCancel()
         session = nil
     }
@@ -147,6 +174,7 @@ private final class Drive: ObservableObject {
             if http.statusCode == 401 {
                 token = nil
                 clipboard = nil
+                thumbnails.removeAllObjects()
             }
             struct Failure: Decodable { let error: String }
             let message = data.flatMap { try? JSONDecoder().decode(Failure.self, from: $0).error }
@@ -219,6 +247,26 @@ private final class Drive: ObservableObject {
             }
         }
         return file
+    }
+
+    func thumbnail(for entry: Entry, at path: [String]) async throws -> UIImage {
+        guard let loginToken = token else { throw APIError(message: "请先登录") }
+        let key = "\(path.joined(separator: "/"))\n\(entry.size)\n\(entry.modified ?? 0)" as NSString
+        if let cached = thumbnails.object(forKey: key) { return cached }
+        let file = try await download(path)
+        defer { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
+        try Task.checkCancellation()
+        let request = QLThumbnailGenerator.Request(fileAt: file, size: CGSize(width: 120, height: 120),
+                                                   scale: 2, representationTypes: .thumbnail)
+        let image = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<UIImage, Error>) in
+            QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { representation, error in
+                if let image = representation?.uiImage { continuation.resume(returning: image) }
+                else { continuation.resume(throwing: error ?? APIError(message: "无法生成缩略图")) }
+            }
+        }
+        try Task.checkCancellation()
+        if token == loginToken { thumbnails.setObject(image, forKey: key) }
+        return image
     }
 }
 
@@ -545,18 +593,25 @@ private struct FolderView: View {
                 if entry.directory {
                     NavigationLink { FolderView(drive: drive, path: path + [entry.name]) } label: { row(entry) }
                 } else {
-                    Menu {
-                        fileActions(entry)
-                    } label: {
+                    Button { openPreview(entry) } label: {
                         row(entry)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .contentShape(Rectangle())
                     }
-                    .tint(.primary)
+                    .buttonStyle(.plain)
                     .disabled(busy)
                 }
             }
             .swipeActions(allowsFullSwipe: false) { deleteButton(entry) }
+            .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                if !entry.directory {
+                    Button { chooseDownloadLocation(entry) } label: {
+                        Label("下载", systemImage: "arrow.down.to.line")
+                    }
+                    .tint(.blue)
+                    .disabled(busy)
+                }
+            }
             .contextMenu { itemActions(entry) }
         }
     }
@@ -729,7 +784,8 @@ private struct FolderView: View {
     }
 
     private func row(_ entry: Entry) -> some View {
-        Label {
+        HStack(spacing: 12) {
+            FileThumbnail(drive: drive, entry: entry, path: path + [entry.name])
             VStack(alignment: .leading, spacing: 4) {
                 Text(entry.name)
                 if !entry.directory {
@@ -737,20 +793,8 @@ private struct FolderView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
-        } icon: {
-            Image(systemName: icon(for: entry))
-                .foregroundStyle(.blue).frame(width: 28)
         }
-    }
-
-    private func icon(for entry: Entry) -> String {
-        if entry.directory { return "folder.fill" }
-        let ext = (entry.name as NSString).pathExtension
-        guard let type = UTType(filenameExtension: ext) else { return "doc" }
-        if type.conforms(to: .image) { return "photo" }
-        if type.conforms(to: .movie) { return "film" }
-        if type.conforms(to: .audio) { return "waveform" }
-        return "doc"
+        .padding(.vertical, 3)
     }
 
     private func uploadPhotos(_ selection: [PhotosPickerItem]) async {
@@ -800,6 +844,36 @@ private struct FolderView: View {
     private func show(_ error: Error) {
         self.error = error.localizedDescription
         showingError = true
+    }
+}
+
+private struct FileThumbnail: View {
+    let drive: Drive
+    let entry: Entry
+    let path: [String]
+    @State private var image: UIImage?
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 9).fill(Color.blue.opacity(0.08))
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Image(systemName: entry.icon)
+                    .font(.title3)
+                    .foregroundStyle(.blue)
+            }
+        }
+        .frame(width: 54, height: 54)
+        .clipShape(RoundedRectangle(cornerRadius: 9))
+        .accessibilityHidden(true)
+        .task(id: entry.modified) {
+            image = nil
+            guard entry.canLoadThumbnail else { return }
+            image = try? await drive.thumbnail(for: entry, at: path)
+        }
     }
 }
 
