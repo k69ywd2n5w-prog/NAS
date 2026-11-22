@@ -285,54 +285,7 @@ private struct FolderView: View {
     private var visible: [Entry] { entries.filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) } }
 
     var body: some View {
-        List(visible) { entry in
-            Group {
-                if entry.directory {
-                    NavigationLink { FolderView(drive: drive, path: path + [entry.name]) } label: { row(entry) }
-                } else {
-                    Button { run {
-                        transferStatus = "正在下载 \(entry.name)"
-                        export = Export(url: try await drive.download(path + [entry.name]))
-                    } } label: { row(entry) }
-                        .buttonStyle(.plain)
-                }
-            }
-            .swipeActions(allowsFullSwipe: false) { deleteButton(entry) }
-            .contextMenu { itemActions(entry) }
-        }
-        .overlay {
-            if busy {
-                ProgressView(transferStatus ?? "正在加载…")
-                    .padding(20)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
-                    .padding()
-                    .accessibilityElement(children: .combine)
-            }
-            else if entries.isEmpty { Text("文件夹为空").foregroundStyle(.secondary) }
-            else if visible.isEmpty { Text("没有匹配的文件").foregroundStyle(.secondary) }
-        }
-        .navigationTitle(path.last ?? "我的文件")
-        .searchable(text: $query, prompt: "搜索当前文件夹")
-        .safeAreaInset(edge: .bottom) { clipboardBar }
-        .toolbar { fileToolbar }
-        .task { await refresh() }
-        .refreshable { await refresh() }
-        .photosPicker(isPresented: $pickingPhotos, selection: $photos, maxSelectionCount: 30,
-                      matching: .any(of: [.images, .videos]), preferredItemEncoding: .current)
-        .onChange(of: photos) { _, selection in
-            guard !selection.isEmpty else { return }
-            photos = []
-            run { await uploadPhotos(selection) }
-        }
-        .fileImporter(isPresented: $importing, allowedContentTypes: [.item]) { result in
-            run {
-                let file = try result.get()
-                transferStatus = "正在上传 \(file.lastPathComponent)"
-                try await drive.upload(file, to: path)
-                entries = try await drive.list(path)
-                transferResult = "已上传 \(file.lastPathComponent)"
-            }
-        }
+        fileBrowser
         .alert("新建文件夹", isPresented: $creating) {
             TextField("文件夹名称", text: $folder)
             Button("取消", role: .cancel) {}
@@ -381,6 +334,51 @@ private struct FolderView: View {
         } message: { Text(transferResult ?? "") }
         .sheet(item: $export, onDismiss: { export = nil }) { item in
             FilePreview(file: item.url)
+        }
+    }
+
+    private var fileList: some View {
+        List(visible) { entry in
+            Group {
+                if entry.directory {
+                    NavigationLink { FolderView(drive: drive, path: path + [entry.name]) } label: { row(entry) }
+                } else {
+                    Button { run {
+                        transferStatus = "正在下载 \(entry.name)"
+                        export = Export(url: try await drive.download(path + [entry.name]))
+                    } } label: { row(entry) }
+                        .buttonStyle(.plain)
+                }
+            }
+            .swipeActions(allowsFullSwipe: false) { deleteButton(entry) }
+            .contextMenu { itemActions(entry) }
+        }
+    }
+
+    private var fileBrowser: some View {
+        fileList
+        .overlay { folderOverlay }
+        .navigationTitle(path.last ?? "我的文件")
+        .searchable(text: $query, prompt: "搜索当前文件夹")
+        .safeAreaInset(edge: .bottom) { clipboardBar }
+        .toolbar { fileToolbar }
+        .task { await refresh() }
+        .refreshable { await refresh() }
+        .photosPicker(isPresented: $pickingPhotos, selection: $photos, maxSelectionCount: 30,
+                      matching: .any(of: [.images, .videos]), preferredItemEncoding: .current)
+        .onChange(of: photos) { _, selection in
+            guard !selection.isEmpty else { return }
+            photos = []
+            run { await uploadPhotos(selection) }
+        }
+        .fileImporter(isPresented: $importing, allowedContentTypes: [.item]) { result in
+            run {
+                let file = try result.get()
+                transferStatus = "正在上传 \(file.lastPathComponent)"
+                try await drive.upload(file, to: path)
+                entries = try await drive.list(path)
+                transferResult = "已上传 \(file.lastPathComponent)"
+            }
         }
     }
 
@@ -437,6 +435,20 @@ private struct FolderView: View {
         .disabled(busy)
     }
 
+    @ViewBuilder
+    private var folderOverlay: some View {
+        if busy {
+            ProgressView(transferStatus ?? "正在加载…")
+                .padding(20)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                .padding()
+                .accessibilityElement(children: .combine)
+        }
+        else if entries.isEmpty { Text("文件夹为空").foregroundStyle(.secondary) }
+        else if visible.isEmpty { Text("没有匹配的文件").foregroundStyle(.secondary) }
+    }
+
+    @ToolbarContentBuilder
     private var fileToolbar: some ToolbarContent {
         ToolbarItem(placement: .navigationBarTrailing) {
             Menu {
