@@ -1,0 +1,31 @@
+# 私人网盘
+
+Windows 服务端把文件保存在 `E:\PrivateNAS`。iPhone 客户端支持账号登录、文件夹浏览、当前目录搜索、上传、下载后分享或存入「文件」、新建目录及删除。单次上传上限为 20 GiB。同名上传会被拒绝，文件夹须清空后才能删除。
+
+## Windows
+
+现有电脑可使用已找到的 Node.js 运行时。其他电脑需要 Node.js 22 或更新版本，并用 PowerShell 7 生成证书。以下命令在项目根目录执行。
+
+```powershell
+./server/New-TlsIdentity.ps1 -ServerName 192.168.0.111
+./server/Set-Owner.ps1 -Username mynas
+./server/Start-NAS.ps1
+```
+
+证书只需生成一次。保存脚本输出的 64 位十六进制 SHA-256 指纹，并从可信渠道在 iPhone 上录入。证书私钥及账号哈希存放于 `%LOCALAPPDATA%\PrivateNAS`。再次运行 `Set-Owner.ps1` 可更换账号或密码，旧登录立即失效。用户名使用 1–32 个字符，可用中文、字母、数字、下划线或连字符。新设密码使用 8–12 个字符，由 Windows 终端隐藏输入。默认只有一个网盘所有者账号。
+
+在管理员 PowerShell 中运行 `./server/Enable-Firewall.ps1`，放行专用网络上的 TCP 8787。如果 Node.js 未加入 PATH，给上述账号、启动及防火墙脚本传入 `-NodePath 'C:\实际位置\node.exe'`。前台运行时请保持窗口打开。电脑需要联网且处于唤醒状态。
+
+## iPhone
+
+用 Mac 上的 Xcode 打开 `ios/PrivateNAS.xcodeproj`，在目标的 **Signing & Capabilities** 中选择自己的签名团队并运行到 iOS 17 或更新版本的 iPhone。如果签名提示 Bundle Identifier 冲突，可换成自己的标识。
+
+先让手机连接家里 Wi‑Fi，地址填 `https://192.168.0.111:8787`，再输入 Windows 输出的证书指纹和网盘账号。使用受系统信任的证书时可留空指纹。使用自签名证书时，App 按指纹校验服务器身份，同一张证书可以用于局域网和公网两个地址。更换证书后从 Windows 重新确认指纹。
+
+## 公网直连
+
+1. 在路由器管理页看 WAN IPv4，并和家庭网络对外显示的公网 IPv4 比较。若 WAN 处于运营商级 NAT，需向运营商申请公网 IPv4，或使用可入站的公网 IPv6。也可以部署自管公网中继，本项目当前实现的是直连。
+2. 在路由器为 Windows 电脑保留 `192.168.0.111`，添加 TCP 8787 到该电脑 TCP 8787 的端口转发。仅转发网盘的 HTTPS 端口。IPv6 直连时将服务端环境变量 `NAS_BIND` 设为 `::`，并在路由器 IPv6 防火墙放行该端口。
+3. 在 iPhone 上关 Wi‑Fi，用移动数据连接 `https://公网IPv4:8787`，或填指向公网地址的域名。IPv6 字面地址写成 `https://[IPv6地址]:8787`。使用同一个网盘账号和证书指纹。
+
+IPv4 变化后，在 App 里更新地址，或自行维护域名的 DNS 记录。直连需要 Windows 服务器进程保持运行。
