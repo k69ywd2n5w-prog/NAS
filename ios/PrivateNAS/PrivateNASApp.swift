@@ -113,12 +113,14 @@ private final class Drive: ObservableObject {
         session = nil
     }
 
-    private func request(_ method: String, _ action: String, path: [String] = []) throws -> URLRequest {
+    private func request(_ method: String, _ action: String, path: [String] = [], recursive: Bool = false) throws -> URLRequest {
         guard let base else { throw APIError(message: "请先登录") }
         let endpoint = base.appendingPathComponent("api").appendingPathComponent(action)
         var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)!
         if !path.isEmpty {
-            components.queryItems = [URLQueryItem(name: "path", value: path.joined(separator: "/"))]
+            var query = [URLQueryItem(name: "path", value: path.joined(separator: "/"))]
+            if recursive { query.append(URLQueryItem(name: "recursive", value: "true")) }
+            components.queryItems = query
             components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         }
         var request = URLRequest(url: components.url!)
@@ -153,7 +155,9 @@ private final class Drive: ObservableObject {
     }
 
     func create(_ path: [String]) async throws { _ = try await send(request("POST", "folder", path: path)) }
-    func delete(_ path: [String]) async throws { _ = try await send(request("DELETE", "file", path: path)) }
+    func delete(_ path: [String], directory: Bool) async throws {
+        _ = try await send(request("DELETE", "file", path: path, recursive: directory))
+    }
 
     func upload(_ file: URL, to path: [String]) async throws {
         guard let session else { throw APIError(message: "请先登录") }
@@ -271,7 +275,8 @@ private struct FolderView: View {
                         .buttonStyle(.plain)
                 }
             }
-            .swipeActions { Button("删除", role: .destructive) { deleting = entry } }
+            .swipeActions(allowsFullSwipe: false) { deleteButton(entry) }
+            .contextMenu { deleteButton(entry) }
         }
         .overlay {
             if busy {
@@ -316,10 +321,18 @@ private struct FolderView: View {
                 }
             }
         }
-        .confirmationDialog("永久删除此项目？", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }), presenting: deleting) { entry in
-            Button("删除 \(entry.name)", role: .destructive) {
-                run { try await drive.delete(path + [entry.name]); entries = try await drive.list(path) }
+        .confirmationDialog("永久删除", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }), titleVisibility: .visible, presenting: deleting) { entry in
+            Button(entry.directory ? "删除文件夹及其内容" : "删除文件", role: .destructive) {
+                run {
+                    try await drive.delete(path + [entry.name], directory: entry.directory)
+                    entries = try await drive.list(path)
+                }
             }
+            Button("取消", role: .cancel) {}
+        } message: { entry in
+            Text(entry.directory
+                 ? "「\(entry.name)」及其中的所有文件和子文件夹都会被永久删除。"
+                 : "「\(entry.name)」将被永久删除。")
         }
         .alert("操作失败", isPresented: $showingError) { Button("确定", role: .cancel) {} } message: { Text(error) }
         .alert("传输结果", isPresented: Binding(get: { transferResult != nil }, set: { if !$0 { transferResult = nil } })) {
@@ -328,6 +341,13 @@ private struct FolderView: View {
         .sheet(item: $export, onDismiss: { export = nil }) { item in
             FilePreview(file: item.url)
         }
+    }
+
+    private func deleteButton(_ entry: Entry) -> some View {
+        Button(role: .destructive) { deleting = entry } label: {
+            Label("删除", systemImage: "trash")
+        }
+        .disabled(busy)
     }
 
     private var fileToolbar: some ToolbarContent {
@@ -441,22 +461,53 @@ private struct FolderView: View {
 
 private struct FilePreview: View {
     let file: URL
-    @State private var preview: URL?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
-            List {
+            Group {
                 if QLPreviewController.canPreview(file as NSURL) {
-                    Button { preview = file } label: { Label("预览", systemImage: "eye") }
+                    QuickLookFile(file: file)
+                } else {
+                    ContentUnavailableView("无法预览此格式", systemImage: "doc",
+                                           description: Text("可以分享文件，或存到「文件」后用其他 App 打开。"))
                 }
-                ShareLink(item: file) { Label("分享或存储到「文件」", systemImage: "square.and.arrow.up") }
             }
             .navigationTitle(file.lastPathComponent)
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { Button("完成") { dismiss() } }
-            .quickLookPreview($preview)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) { Button("完成") { dismiss() } }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    ShareLink(item: file) { Label("分享或存储到「文件」", systemImage: "square.and.arrow.up") }
+                }
+            }
         }
-        .presentationDetents([.medium, .large])
+    }
+}
+
+private struct QuickLookFile: UIViewControllerRepresentable {
+    let file: URL
+
+    func makeCoordinator() -> Coordinator { Coordinator(file: file) }
+
+    func makeUIViewController(context: Context) -> QLPreviewController {
+        let controller = QLPreviewController()
+        controller.dataSource = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ controller: QLPreviewController, context: Context) {
+        guard context.coordinator.file != file else { return }
+        context.coordinator.file = file
+        controller.reloadData()
+    }
+
+    final class Coordinator: NSObject, QLPreviewControllerDataSource {
+        var file: URL
+        init(file: URL) { self.file = file }
+        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> any QLPreviewItem {
+            file as NSURL
+        }
     }
 }

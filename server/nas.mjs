@@ -160,7 +160,10 @@ async function serve() {
     if (route === 'DELETE /api/file') {
       const destination = await resolve(names);
       const info = await fs.lstat(destination);
-      if (info.isDirectory()) await fs.rmdir(destination);
+      if (url.searchParams.get('recursive') === 'true') {
+        if (!info.isDirectory()) throw fail(409, '此项目已不再是文件夹，请刷新后重试');
+        await fs.rm(destination, { recursive: true });
+      } else if (info.isDirectory()) await fs.rmdir(destination);
       else if (info.isFile()) await fs.unlink(destination);
       else throw fail(403, '无法删除此项目');
       return json(res, 200, { ok: true });
