@@ -188,16 +188,30 @@ private final class Drive: ObservableObject {
         try check(response, data)
     }
 
-    func download(_ path: [String]) async throws -> URL {
+    func download(_ path: [String], into selectedFolder: URL? = nil) async throws -> URL {
         guard let session, let name = path.last else { throw APIError(message: "请选择文件") }
+        let files = FileManager.default
+        let accessed = selectedFolder?.startAccessingSecurityScopedResource() ?? false
+        defer { if accessed { selectedFolder?.stopAccessingSecurityScopedResource() } }
+        let folder = selectedFolder ?? files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let file = folder.appendingPathComponent(name)
+        let conflict = APIError(message: "保存位置已有同名文件，请选择其他位置")
+        if selectedFolder != nil && files.fileExists(atPath: file.path) { throw conflict }
         let request = try request("GET", "file", path: path)
         let (temporary, response) = try await session.download(for: request)
-        defer { try? FileManager.default.removeItem(at: temporary) }
+        defer { try? files.removeItem(at: temporary) }
         try check(response)
-        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let file = folder.appendingPathComponent(name)
-        try FileManager.default.moveItem(at: temporary, to: file)
+        if selectedFolder != nil {
+            do { try files.copyItem(at: temporary, to: file) }
+            catch let error as CocoaError where error.code == .fileWriteFileExists { throw conflict }
+        } else {
+            try files.createDirectory(at: folder, withIntermediateDirectories: true)
+            do { try files.moveItem(at: temporary, to: file) }
+            catch {
+                try? files.removeItem(at: folder)
+                throw error
+            }
+        }
         return file
     }
 }
@@ -217,47 +231,227 @@ struct PrivateNASApp: App {
     }
 }
 
+private struct ServerProfile: Codable, Identifiable {
+    var id = UUID()
+    var name = ""
+    var address = ""
+    var username = ""
+    var fingerprint = ""
+
+    static let home = ServerProfile(
+        id: UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)),
+        name: "家庭网盘", address: "https://192.168.0.111:8787", username: "chenzheng",
+        fingerprint: "7F750F97D5F2346542CCBAB63B945C1C39792DCF220C1926F91FDCFD20F9AB4C")
+}
+
+private enum ServerPasswords {
+    private static func query(for id: UUID) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: "PrivateNAS.ServerPassword",
+         kSecAttrAccount as String: id.uuidString]
+    }
+
+    static func read(for id: UUID) throws -> String? {
+        var query = query(for: id)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var value: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &value)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = value as? Data, let password = String(data: data, encoding: .utf8) else {
+            throw APIError(message: "无法读取 iPhone 钥匙串（\(status)）")
+        }
+        return password
+    }
+
+    static func save(_ password: String, for id: UUID) throws {
+        var item = query(for: id)
+        let data = Data(password.utf8)
+        let updates = [kSecValueData as String: data]
+        var status = SecItemUpdate(item as CFDictionary, updates as CFDictionary)
+        if status == errSecItemNotFound {
+            item[kSecValueData as String] = data
+            item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            status = SecItemAdd(item as CFDictionary, nil)
+        }
+        guard status == errSecSuccess else {
+            throw APIError(message: "无法保存密码到 iPhone 钥匙串（\(status)）")
+        }
+    }
+}
+
 private struct LoginView: View {
     @ObservedObject var drive: Drive
-    @AppStorage("serverAddress") private var address = ""
-    @AppStorage("serverFingerprint") private var fingerprint = ""
-    @AppStorage("ownerName") private var username = ""
+    @AppStorage("serverProfiles") private var storedProfiles = Data()
+    @State private var editor: ServerEditorRequest?
+    @State private var error = ""
+    @State private var connecting: UUID?
+
+    private var profiles: [ServerProfile] {
+        (try? JSONDecoder().decode([ServerProfile].self, from: storedProfiles)) ?? [.home]
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("选择服务器") {
+                    ForEach(profiles) { profile in
+                        Button { connect(profile) } label: {
+                            HStack {
+                                Label(profile.name, systemImage: "externaldrive.connected.to.line.below")
+                                Spacer()
+                                if connecting == profile.id { ProgressView() }
+                                else { Image(systemName: "chevron.right").foregroundStyle(.secondary) }
+                            }
+                        }
+                        .disabled(connecting != nil)
+                        .contextMenu {
+                            Button {
+                                editor = ServerEditorRequest(profile: profile)
+                            } label: { Label("编辑服务器", systemImage: "pencil") }
+                        }
+                    }
+                    Button {
+                        editor = ServerEditorRequest(profile: ServerProfile())
+                    } label: { Label("新增服务器", systemImage: "plus.circle") }
+                    .disabled(connecting != nil)
+                }
+                if !error.isEmpty { Text(error).foregroundStyle(.red) }
+            }
+            .navigationTitle("私人网盘")
+            .sheet(item: $editor) { request in
+                ServerEditor(request: request) { profile, password in
+                    try save(profile, password: password)
+                    if request.passwordOnly { connect(profile) }
+                }
+            }
+            .onAppear(perform: migratePreviousServer)
+        }
+    }
+
+    private func connect(_ profile: ServerProfile) {
+        guard connecting == nil else { return }
+        error = ""
+        do {
+            guard let password = try ServerPasswords.read(for: profile.id) else {
+                editor = ServerEditorRequest(profile: profile, passwordOnly: true)
+                return
+            }
+            connecting = profile.id
+            Task {
+                defer { connecting = nil }
+                do {
+                    try await drive.login(address: profile.address, fingerprint: profile.fingerprint,
+                                          username: profile.username, password: password)
+                } catch { self.error = "\(error.localizedDescription)  如需更新密码，请长按服务器并选择「编辑服务器」。" }
+            }
+        } catch { self.error = error.localizedDescription }
+    }
+
+    private func save(_ profile: ServerProfile, password: String) throws {
+        var updated = profiles
+        if let index = updated.firstIndex(where: { $0.id == profile.id }) { updated[index] = profile }
+        else { updated.append(profile) }
+        let data = try JSONEncoder().encode(updated)
+        if !password.isEmpty { try ServerPasswords.save(password, for: profile.id) }
+        storedProfiles = data
+        error = ""
+    }
+
+    private func migratePreviousServer() {
+        guard storedProfiles.isEmpty,
+              let address = UserDefaults.standard.string(forKey: "serverAddress"), !address.isEmpty,
+              address != ServerProfile.home.address else { return }
+        let profile = ServerProfile(name: "之前的服务器", address: address,
+                                    username: UserDefaults.standard.string(forKey: "ownerName") ?? "",
+                                    fingerprint: UserDefaults.standard.string(forKey: "serverFingerprint") ?? "")
+        try? save(profile, password: "")
+    }
+}
+
+private struct ServerEditorRequest: Identifiable {
+    var id: UUID { profile.id }
+    let profile: ServerProfile
+    var passwordOnly = false
+}
+
+private struct ServerEditor: View {
+    @Environment(\.dismiss) private var dismiss
+    let request: ServerEditorRequest
+    let onSave: (ServerProfile, String) throws -> Void
+    @State private var profile: ServerProfile
     @State private var password = ""
     @State private var error = ""
-    @State private var busy = false
+
+    init(request: ServerEditorRequest, onSave: @escaping (ServerProfile, String) throws -> Void) {
+        self.request = request
+        self.onSave = onSave
+        _profile = State(initialValue: request.profile)
+    }
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("服务器") {
-                    TextField("https://公网地址:8787", text: $address)
-                        .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
-                    TextField("自签名证书 SHA-256 指纹", text: $fingerprint)
-                        .textInputAutocapitalization(.never).autocorrectionDisabled()
-                }
-                Section("网盘账号") {
-                    TextField("用户名", text: $username).textContentType(.username)
-                        .textInputAutocapitalization(.never).autocorrectionDisabled()
-                    SecureField("密码", text: $password).textContentType(.password)
-                }
-                Button {
-                    Task {
-                        busy = true
-                        defer { busy = false }
-                        error = ""
-                        do {
-                            try await drive.login(address: address, fingerprint: fingerprint, username: username, password: password)
-                            password = ""
-                        } catch { self.error = error.localizedDescription }
+                if !request.passwordOnly {
+                    Section("服务器") {
+                        TextField("名称", text: $profile.name)
+                        TextField("https://服务器地址:8787", text: $profile.address)
+                            .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
+                        TextField("自签名证书 SHA-256 指纹", text: $profile.fingerprint)
+                            .textInputAutocapitalization(.never).autocorrectionDisabled()
+                        TextField("用户名", text: $profile.username)
+                            .textContentType(.username).textInputAutocapitalization(.never).autocorrectionDisabled()
                     }
-                } label: {
-                    if busy { ProgressView() } else { Text("登录") }
                 }
-                .disabled(busy || address.isEmpty || username.isEmpty || password.isEmpty)
+                Section {
+                    SecureField("网盘密码", text: $password).textContentType(.password)
+                } header: {
+                    Text("登录凭据")
+                } footer: {
+                    Text("密码保存在这台 iPhone 的钥匙串中。")
+                }
                 if !error.isEmpty { Text(error).foregroundStyle(.red) }
             }
-            .navigationTitle("私人网盘")
+            .navigationTitle(request.passwordOnly ? profile.name : "服务器设置")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(request.passwordOnly ? "保存并连接" : "保存", action: save)
+                }
+            }
         }
+    }
+
+    private func save() {
+        do {
+            profile.name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            profile.address = profile.address.trimmingCharacters(in: .whitespacesAndNewlines)
+            profile.username = profile.username.trimmingCharacters(in: .whitespacesAndNewlines)
+            profile.fingerprint = profile.fingerprint.filter { !$0.isWhitespace && $0 != ":" }.lowercased()
+            guard !profile.name.isEmpty, !profile.username.isEmpty,
+                  let url = URL(string: profile.address), url.scheme?.lowercased() == "https", url.host != nil,
+                  url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
+                  url.path.isEmpty || url.path == "/" else {
+                throw APIError(message: "请填写名称、HTTPS 地址和用户名。")
+            }
+            guard profile.fingerprint.isEmpty ||
+                    profile.fingerprint.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil else {
+                throw APIError(message: "证书指纹应为 64 个十六进制字符。")
+            }
+            let original = request.profile
+            let connectionChanged = profile.address != original.address || profile.username != original.username ||
+                profile.fingerprint != original.fingerprint.lowercased()
+            if password.isEmpty {
+                guard !connectionChanged else { throw APIError(message: "请输入网盘密码。") }
+                guard try ServerPasswords.read(for: profile.id) != nil else {
+                    throw APIError(message: "请输入网盘密码。")
+                }
+            }
+            try onSave(profile, password)
+            password = ""
+            dismiss()
+        } catch { self.error = error.localizedDescription }
     }
 }
 
@@ -267,6 +461,7 @@ private struct FolderView: View {
     @State private var entries: [Entry] = []
     @State private var query = ""
     @State private var importing = false
+    @State private var pendingDownload: Entry?
     @State private var pickingPhotos = false
     @State private var photos: [PhotosPickerItem] = []
     @State private var transferStatus: String?
@@ -277,6 +472,7 @@ private struct FolderView: View {
     @State private var renaming: Entry?
     @State private var newName = ""
     @State private var export: Export?
+    @State private var previewCache: URL?
     @State private var busy = false
     @State private var error = ""
     @State private var showingError = false
@@ -332,7 +528,7 @@ private struct FolderView: View {
         .alert("传输结果", isPresented: Binding(get: { transferResult != nil }, set: { if !$0 { transferResult = nil } })) {
             Button("确定", role: .cancel) { transferResult = nil }
         } message: { Text(transferResult ?? "") }
-        .sheet(item: $export, onDismiss: { export = nil }) { item in
+        .sheet(item: $export, onDismiss: clearPreview) { item in
             FilePreview(file: item.url)
         }
     }
@@ -343,11 +539,15 @@ private struct FolderView: View {
                 if entry.directory {
                     NavigationLink { FolderView(drive: drive, path: path + [entry.name]) } label: { row(entry) }
                 } else {
-                    Button { run {
-                        transferStatus = "正在下载 \(entry.name)"
-                        export = Export(url: try await drive.download(path + [entry.name]))
-                    } } label: { row(entry) }
-                        .buttonStyle(.plain)
+                    Menu {
+                        fileActions(entry)
+                    } label: {
+                        row(entry)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                    .tint(.primary)
+                    .disabled(busy)
                 }
             }
             .swipeActions(allowsFullSwipe: false) { deleteButton(entry) }
@@ -371,19 +571,58 @@ private struct FolderView: View {
             photos = []
             run { await uploadPhotos(selection) }
         }
-        .fileImporter(isPresented: $importing, allowedContentTypes: [.item]) { result in
-            run {
-                let file = try result.get()
-                transferStatus = "正在上传 \(file.lastPathComponent)"
-                try await drive.upload(file, to: path)
+        .fileImporter(isPresented: $importing, allowedContentTypes: pendingDownload == nil ? [.item] : [.folder],
+                      onCompletion: finishPickingLocation)
+    }
+
+    private func openPreview(_ entry: Entry) {
+        run {
+            transferStatus = "正在准备预览…"
+            let file = try await drive.download(path + [entry.name])
+            previewCache = file.deletingLastPathComponent()
+            export = Export(url: file)
+        }
+    }
+
+    private func clearPreview() {
+        if let previewCache { try? FileManager.default.removeItem(at: previewCache) }
+        previewCache = nil
+    }
+
+    private func chooseDownloadLocation(_ entry: Entry) {
+        pendingDownload = entry
+        importing = true
+    }
+
+    private func finishPickingLocation(_ result: Result<URL, Error>) {
+        let downloadEntry = pendingDownload
+        pendingDownload = nil
+        run {
+            let location = try result.get()
+            if let entry = downloadEntry {
+                transferStatus = "正在下载 \(entry.name)"
+                _ = try await drive.download(path + [entry.name], into: location)
+                transferResult = "已将「\(entry.name)」保存到「\(location.lastPathComponent)」。"
+            } else {
+                transferStatus = "正在上传 \(location.lastPathComponent)"
+                try await drive.upload(location, to: path)
                 entries = try await drive.list(path)
-                transferResult = "已上传 \(file.lastPathComponent)"
+                transferResult = "已上传 \(location.lastPathComponent)"
             }
         }
     }
 
     @ViewBuilder
+    private func fileActions(_ entry: Entry) -> some View {
+        Button { openPreview(entry) } label: { Label("预览", systemImage: "eye") }
+        Button { chooseDownloadLocation(entry) } label: {
+            Label("下载并选择保存位置", systemImage: "arrow.down.to.line")
+        }
+    }
+
+    @ViewBuilder
     private func itemActions(_ entry: Entry) -> some View {
+        if !entry.directory { fileActions(entry).disabled(busy) }
         Button { drive.clipboard = ClipboardItem(path: path + [entry.name], move: false) } label: {
             Label("复制", systemImage: "document.on.document")
         }
@@ -455,7 +694,7 @@ private struct FolderView: View {
                 Button { pickingPhotos = true } label: {
                     Label("上传照片和视频", systemImage: "photo.on.rectangle.angled")
                 }
-                Button { importing = true } label: {
+                Button { pendingDownload = nil; importing = true } label: {
                     Label("上传文件", systemImage: "square.and.arrow.up")
                 }
             } label: {
