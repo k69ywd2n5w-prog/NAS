@@ -1,4 +1,7 @@
 import CryptoKit
+import CoreTransferable
+import PhotosUI
+import QuickLook
 import Security
 import SwiftUI
 import UniformTypeIdentifiers
@@ -13,6 +16,30 @@ private struct Entry: Decodable, Identifiable {
 private struct APIError: LocalizedError {
     let message: String
     var errorDescription: String? { message }
+}
+
+private struct PhotoFile: Transferable {
+    let url: URL
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(importedContentType: .image) { try copy($0.file) }
+        FileRepresentation(importedContentType: .movie) { try copy($0.file) }
+    }
+
+    private static func copy(_ source: URL) throws -> Self {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        // Keep the extension supplied by Photos and give each imported file a unique name.
+        let prefix = String(folder.lastPathComponent.prefix(8))
+        let file = folder.appendingPathComponent(prefix + "-" + source.lastPathComponent)
+        do {
+            try FileManager.default.copyItem(at: source, to: file)
+            return Self(url: file)
+        } catch {
+            try? FileManager.default.removeItem(at: folder)
+            throw error
+        }
+    }
 }
 
 private final class ServerTrust: NSObject, URLSessionTaskDelegate, Sendable {
@@ -216,6 +243,10 @@ private struct FolderView: View {
     @State private var entries: [Entry] = []
     @State private var query = ""
     @State private var importing = false
+    @State private var pickingPhotos = false
+    @State private var photos: [PhotosPickerItem] = []
+    @State private var transferStatus: String?
+    @State private var transferResult: String?
     @State private var creating = false
     @State private var folder = ""
     @State private var deleting: Entry?
@@ -233,14 +264,23 @@ private struct FolderView: View {
                 if entry.directory {
                     NavigationLink { FolderView(drive: drive, path: path + [entry.name]) } label: { row(entry) }
                 } else {
-                    Button { run { export = Export(url: try await drive.download(path + [entry.name])) } } label: { row(entry) }
+                    Button { run {
+                        transferStatus = "正在下载 \(entry.name)"
+                        export = Export(url: try await drive.download(path + [entry.name]))
+                    } } label: { row(entry) }
                         .buttonStyle(.plain)
                 }
             }
             .swipeActions { Button("删除", role: .destructive) { deleting = entry } }
         }
         .overlay {
-            if busy { ProgressView().padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12)) }
+            if busy {
+                ProgressView(transferStatus ?? "正在加载…")
+                    .padding(20)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    .padding()
+                    .accessibilityElement(children: .combine)
+            }
             else if entries.isEmpty { Text("文件夹为空").foregroundStyle(.secondary) }
             else if visible.isEmpty { Text("没有匹配的文件").foregroundStyle(.secondary) }
         }
@@ -249,8 +289,21 @@ private struct FolderView: View {
         .toolbar { fileToolbar }
         .task { await refresh() }
         .refreshable { await refresh() }
+        .photosPicker(isPresented: $pickingPhotos, selection: $photos, maxSelectionCount: 30,
+                      matching: .any(of: [.images, .videos]), preferredItemEncoding: .current)
+        .onChange(of: photos) { _, selection in
+            guard !selection.isEmpty else { return }
+            photos = []
+            run { await uploadPhotos(selection) }
+        }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.item]) { result in
-            run { try await drive.upload(result.get(), to: path); entries = try await drive.list(path) }
+            run {
+                let file = try result.get()
+                transferStatus = "正在上传 \(file.lastPathComponent)"
+                try await drive.upload(file, to: path)
+                entries = try await drive.list(path)
+                transferResult = "已上传 \(file.lastPathComponent)"
+            }
         }
         .alert("新建文件夹", isPresented: $creating) {
             TextField("文件夹名称", text: $folder)
@@ -269,22 +322,30 @@ private struct FolderView: View {
             }
         }
         .alert("操作失败", isPresented: $showingError) { Button("确定", role: .cancel) {} } message: { Text(error) }
+        .alert("传输结果", isPresented: Binding(get: { transferResult != nil }, set: { if !$0 { transferResult = nil } })) {
+            Button("确定", role: .cancel) { transferResult = nil }
+        } message: { Text(transferResult ?? "") }
         .sheet(item: $export, onDismiss: { export = nil }) { item in
-            VStack(spacing: 20) {
-                Text(item.url.lastPathComponent).font(.headline)
-                ShareLink(item: item.url) { Label("分享或存储到「文件」", systemImage: "square.and.arrow.up") }
-            }
-            .padding()
-            .presentationDetents([.medium])
+            FilePreview(file: item.url)
         }
     }
 
     private var fileToolbar: some ToolbarContent {
         ToolbarItem(placement: .navigationBarTrailing) {
             Menu {
+                Button { pickingPhotos = true } label: {
+                    Label("上传照片和视频", systemImage: "photo.on.rectangle.angled")
+                }
                 Button { importing = true } label: {
                     Label("上传文件", systemImage: "square.and.arrow.up")
                 }
+            } label: {
+                Label("上传", systemImage: "plus.circle.fill")
+            }
+            .disabled(busy)
+        }
+        ToolbarItem(placement: .navigationBarTrailing) {
+            Menu {
                 Button {
                     folder = ""
                     creating = true
@@ -313,9 +374,45 @@ private struct FolderView: View {
                 }
             }
         } icon: {
-            Image(systemName: entry.directory ? "folder.fill" : "doc")
+            Image(systemName: icon(for: entry))
                 .foregroundStyle(.blue).frame(width: 28)
         }
+    }
+
+    private func icon(for entry: Entry) -> String {
+        if entry.directory { return "folder.fill" }
+        let ext = (entry.name as NSString).pathExtension
+        guard let type = UTType(filenameExtension: ext) else { return "doc" }
+        if type.conforms(to: .image) { return "photo" }
+        if type.conforms(to: .movie) { return "film" }
+        if type.conforms(to: .audio) { return "waveform" }
+        return "doc"
+    }
+
+    private func uploadPhotos(_ selection: [PhotosPickerItem]) async {
+        var uploaded = 0
+        var firstFailure: String?
+        for (index, item) in selection.enumerated() {
+            transferStatus = "正在上传相册项目 \(index + 1) / \(selection.count)"
+            do {
+                guard let photo = try await item.loadTransferable(type: PhotoFile.self) else {
+                    throw APIError(message: "无法读取所选照片或视频")
+                }
+                defer { try? FileManager.default.removeItem(at: photo.url.deletingLastPathComponent()) }
+                try await drive.upload(photo.url, to: path)
+                uploaded += 1
+            } catch {
+                firstFailure = firstFailure ?? error.localizedDescription
+                if drive.token == nil { break }
+            }
+        }
+        if drive.token != nil {
+            do { entries = try await drive.list(path) }
+            catch { firstFailure = firstFailure ?? error.localizedDescription }
+        }
+        var result = "已上传 \(uploaded) / \(selection.count) 个项目。"
+        if let firstFailure { result += "\n\(firstFailure)" }
+        transferResult = result
     }
 
     private func refresh() async {
@@ -330,7 +427,7 @@ private struct FolderView: View {
         guard !busy else { return }
         busy = true
         Task {
-            defer { busy = false }
+            defer { busy = false; transferStatus = nil }
             do { try await action() }
             catch { show(error) }
         }
@@ -339,5 +436,27 @@ private struct FolderView: View {
     private func show(_ error: Error) {
         self.error = error.localizedDescription
         showingError = true
+    }
+}
+
+private struct FilePreview: View {
+    let file: URL
+    @State private var preview: URL?
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if QLPreviewController.canPreview(file as NSURL) {
+                    Button { preview = file } label: { Label("预览", systemImage: "eye") }
+                }
+                ShareLink(item: file) { Label("分享或存储到「文件」", systemImage: "square.and.arrow.up") }
+            }
+            .navigationTitle(file.lastPathComponent)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { Button("完成") { dismiss() } }
+            .quickLookPreview($preview)
+        }
+        .presentationDetents([.medium, .large])
     }
 }
