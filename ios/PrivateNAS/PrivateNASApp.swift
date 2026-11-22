@@ -246,16 +246,7 @@ private struct FolderView: View {
         }
         .navigationTitle(path.last ?? "我的文件")
         .searchable(text: $query, prompt: "搜索当前文件夹")
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Button("上传文件", systemImage: "square.and.arrow.up") { importing = true }
-                    Button("新建文件夹", systemImage: "folder.badge.plus") { folder = ""; creating = true }
-                    if path.isEmpty { Button("退出登录", systemImage: "rectangle.portrait.and.arrow.right") { run { await drive.logout() } } }
-                } label: { Label("文件操作", systemImage: "ellipsis.circle") }
-                .disabled(busy)
-            }
-        }
+        .toolbar { fileToolbar }
         .task { await refresh() }
         .refreshable { await refresh() }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.item]) { result in
@@ -285,6 +276,30 @@ private struct FolderView: View {
             }
             .padding()
             .presentationDetents([.medium])
+        }
+    }
+
+    private var fileToolbar: some ToolbarContent {
+        ToolbarItem(placement: .navigationBarTrailing) {
+            Menu {
+                Button { importing = true } label: {
+                    Label("上传文件", systemImage: "square.and.arrow.up")
+                }
+                Button {
+                    folder = ""
+                    creating = true
+                } label: {
+                    Label("新建文件夹", systemImage: "folder.badge.plus")
+                }
+                if path.isEmpty {
+                    Button { run { await drive.logout() } } label: {
+                        Label("退出登录", systemImage: "rectangle.portrait.and.arrow.right")
+                    }
+                }
+            } label: {
+                Label("文件操作", systemImage: "ellipsis.circle")
+            }
+            .disabled(busy)
         }
     }
 
