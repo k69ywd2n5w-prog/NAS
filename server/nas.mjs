@@ -1,6 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
-import { createWriteStream } from 'node:fs';
+import { constants, createWriteStream } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomBytes, scrypt as derive, timingSafeEqual } from 'node:crypto';
@@ -69,6 +69,63 @@ async function serve() {
       current = canonical;
     }
     return current;
+  }
+
+  async function transfer(route, names, targetNames) {
+    if (!targetNames.length) throw fail(400, '请选择目标位置');
+    const source = await resolve(names);
+    const info = await fs.lstat(source);
+    if (!info.isFile() && !info.isDirectory()) throw fail(403, '无法操作此项目');
+    const parent = await resolve(targetNames.slice(0, -1));
+    const destination = path.join(parent, targetNames.at(-1));
+    const relative = path.relative(source, parent);
+    if (info.isDirectory() && (!relative || (!path.isAbsolute(relative) &&
+        relative !== '..' && !relative.startsWith('..' + path.sep)))) {
+      throw fail(400, '不能将文件夹放进自身或其子文件夹');
+    }
+    const existing = await fs.lstat(destination).catch(error => {
+      if (error.code !== 'ENOENT') throw error;
+    });
+    if (existing) throw fail(409, '目标位置已有同名项目');
+
+    if (route === 'POST /api/move') {
+      if (info.isDirectory()) {
+        // On Windows a directory rename cannot replace an existing directory.
+        await fs.rename(source, destination);
+      } else {
+        await fs.link(source, destination);
+        try { await fs.unlink(source); }
+        catch (error) {
+          await fs.unlink(destination).catch(rollback => console.error(rollback));
+          throw error;
+        }
+      }
+      return;
+    }
+
+    const staging = await fs.mkdtemp(path.join(parent, internalPrefix));
+    const copy = path.join(staging, 'item');
+    try {
+      if (info.isDirectory()) {
+        await fs.cp(source, copy, {
+          recursive: true,
+          errorOnExist: true,
+          force: false,
+          filter: async file => {
+            if (path.basename(file).toLowerCase().startsWith(internalPrefix)) return false;
+            const item = await fs.lstat(file);
+            if (!item.isFile() && !item.isDirectory()) throw fail(403, '文件夹包含无法复制的链接');
+            return true;
+          },
+        });
+        await fs.rename(copy, destination);
+      } else {
+        await fs.copyFile(source, copy, constants.COPYFILE_EXCL);
+        await fs.link(copy, destination);
+      }
+    } finally {
+      await fs.rm(staging, { recursive: true, force: true });
+    }
   }
 
   function json(res, status, body) {
@@ -149,6 +206,10 @@ async function serve() {
       return json(res, 200, files);
     }
     if (!names.length) throw fail(400, '请选择文件或文件夹');
+    if (route === 'POST /api/copy' || route === 'POST /api/move') {
+      await transfer(route, names, parts(url.searchParams.get('destination')));
+      return json(res, 200, { ok: true });
+    }
     if (route === 'GET /api/file') {
       const destination = await resolve(names);
       const info = await fs.stat(destination);

@@ -13,6 +13,12 @@ private struct Entry: Decodable, Identifiable {
     var id: String { name }
 }
 
+private struct ClipboardItem {
+    let path: [String]
+    let move: Bool
+    var name: String { path[path.count - 1] }
+}
+
 private struct APIError: LocalizedError {
     let message: String
     var errorDescription: String? { message }
@@ -80,6 +86,7 @@ private final class ServerTrust: NSObject, URLSessionTaskDelegate, Sendable {
 @MainActor
 private final class Drive: ObservableObject {
     @Published var token: String?
+    @Published var clipboard: ClipboardItem?
     private var base: URL?
     private var session: URLSession?
 
@@ -109,17 +116,22 @@ private final class Drive: ObservableObject {
     func logout() async {
         if let request = try? request("POST", "logout") { _ = try? await send(request) }
         token = nil
+        clipboard = nil
         session?.invalidateAndCancel()
         session = nil
     }
 
-    private func request(_ method: String, _ action: String, path: [String] = [], recursive: Bool = false) throws -> URLRequest {
+    private func request(_ method: String, _ action: String, path: [String] = [],
+                         recursive: Bool = false, destination: [String]? = nil) throws -> URLRequest {
         guard let base else { throw APIError(message: "请先登录") }
         let endpoint = base.appendingPathComponent("api").appendingPathComponent(action)
         var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)!
         if !path.isEmpty {
             var query = [URLQueryItem(name: "path", value: path.joined(separator: "/"))]
             if recursive { query.append(URLQueryItem(name: "recursive", value: "true")) }
+            if let destination {
+                query.append(URLQueryItem(name: "destination", value: destination.joined(separator: "/")))
+            }
             components.queryItems = query
             components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         }
@@ -132,7 +144,10 @@ private final class Drive: ObservableObject {
     private func check(_ response: URLResponse, _ data: Data? = nil) throws {
         guard let http = response as? HTTPURLResponse else { throw APIError(message: "服务器响应无效") }
         guard (200..<300).contains(http.statusCode) else {
-            if http.statusCode == 401 { token = nil }
+            if http.statusCode == 401 {
+                token = nil
+                clipboard = nil
+            }
             struct Failure: Decodable { let error: String }
             let message = data.flatMap { try? JSONDecoder().decode(Failure.self, from: $0).error }
             throw APIError(message: message ?? "请求失败（\(http.statusCode)）")
@@ -157,6 +172,11 @@ private final class Drive: ObservableObject {
     func create(_ path: [String]) async throws { _ = try await send(request("POST", "folder", path: path)) }
     func delete(_ path: [String], directory: Bool) async throws {
         _ = try await send(request("DELETE", "file", path: path, recursive: directory))
+    }
+
+    func transfer(_ item: ClipboardItem, to destination: [String]) async throws {
+        let action = item.move ? "move" : "copy"
+        _ = try await send(request("POST", action, path: item.path, destination: destination))
     }
 
     func upload(_ file: URL, to path: [String]) async throws {
@@ -254,6 +274,8 @@ private struct FolderView: View {
     @State private var creating = false
     @State private var folder = ""
     @State private var deleting: Entry?
+    @State private var renaming: Entry?
+    @State private var newName = ""
     @State private var export: Export?
     @State private var busy = false
     @State private var error = ""
@@ -276,7 +298,7 @@ private struct FolderView: View {
                 }
             }
             .swipeActions(allowsFullSwipe: false) { deleteButton(entry) }
-            .contextMenu { deleteButton(entry) }
+            .contextMenu { itemActions(entry) }
         }
         .overlay {
             if busy {
@@ -291,6 +313,7 @@ private struct FolderView: View {
         }
         .navigationTitle(path.last ?? "我的文件")
         .searchable(text: $query, prompt: "搜索当前文件夹")
+        .safeAreaInset(edge: .bottom) { clipboardBar }
         .toolbar { fileToolbar }
         .task { await refresh() }
         .refreshable { await refresh() }
@@ -321,10 +344,28 @@ private struct FolderView: View {
                 }
             }
         }
+        .alert("重命名", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } }), presenting: renaming) { entry in
+            TextField("新名称", text: $newName).autocorrectionDisabled()
+            Button("取消", role: .cancel) {}
+            Button("保存") {
+                let name = newName
+                guard name != entry.name else { return }
+                run {
+                    guard !name.isEmpty, !name.contains("/") else { throw APIError(message: "请输入有效的名称") }
+                    let source = path + [entry.name]
+                    let target = path + [name]
+                    try await drive.transfer(ClipboardItem(path: source, move: true), to: target)
+                    if drive.clipboard?.path.starts(with: source) == true { drive.clipboard = nil }
+                    entries = try await drive.list(path)
+                }
+            }
+        } message: { entry in Text("当前名称：\(entry.name)") }
         .confirmationDialog("永久删除", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }), titleVisibility: .visible, presenting: deleting) { entry in
             Button(entry.directory ? "删除文件夹及其内容" : "删除文件", role: .destructive) {
                 run {
-                    try await drive.delete(path + [entry.name], directory: entry.directory)
+                    let source = path + [entry.name]
+                    try await drive.delete(source, directory: entry.directory)
+                    if drive.clipboard?.path.starts(with: source) == true { drive.clipboard = nil }
                     entries = try await drive.list(path)
                 }
             }
@@ -340,6 +381,52 @@ private struct FolderView: View {
         } message: { Text(transferResult ?? "") }
         .sheet(item: $export, onDismiss: { export = nil }) { item in
             FilePreview(file: item.url)
+        }
+    }
+
+    @ViewBuilder
+    private func itemActions(_ entry: Entry) -> some View {
+        Button { drive.clipboard = ClipboardItem(path: path + [entry.name], move: false) } label: {
+            Label("复制", systemImage: "document.on.document")
+        }
+        .disabled(busy)
+        Button { drive.clipboard = ClipboardItem(path: path + [entry.name], move: true) } label: {
+            Label("剪切", systemImage: "scissors")
+        }
+        .disabled(busy)
+        Button { newName = entry.name; renaming = entry } label: {
+            Label("重命名", systemImage: "pencil")
+        }
+        .disabled(busy)
+        deleteButton(entry)
+    }
+
+    @ViewBuilder
+    private var clipboardBar: some View {
+        if let item = drive.clipboard {
+            HStack {
+                Label(item.name, systemImage: item.move ? "scissors" : "document.on.document")
+                    .lineLimit(1)
+                Spacer()
+                Button(item.move ? "移动到这里" : "粘贴到这里") {
+                    run {
+                        transferStatus = item.move ? "正在移动…" : "正在复制…"
+                        try await drive.transfer(item, to: path + [item.name])
+                        if item.move { drive.clipboard = nil }
+                        entries = try await drive.list(path)
+                        transferResult = item.move ? "移动成功" : "复制成功"
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(busy)
+                Button { drive.clipboard = nil } label: {
+                    Image(systemName: "xmark.circle.fill").accessibilityLabel("清除剪贴板")
+                }
+                .disabled(busy)
+            }
+            .font(.subheadline)
+            .padding()
+            .background(.regularMaterial)
         }
     }
 
