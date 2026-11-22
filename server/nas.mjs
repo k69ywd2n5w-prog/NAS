@@ -212,11 +212,31 @@ async function serve() {
     }
     if (route === 'GET /api/file') {
       const destination = await resolve(names);
-      const info = await fs.stat(destination);
-      if (!info.isFile()) throw fail(400, '请选择文件');
+      if (!(await fs.lstat(destination)).isFile()) throw fail(400, '请选择文件');
       const file = await fs.open(destination, 'r');
-      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': info.size });
-      return pipeline(file.createReadStream(), res);
+      try {
+        const info = await file.stat();
+        if (!info.isFile()) throw fail(400, '请选择文件');
+        if (info.size === 0) {
+          res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': 0 });
+          return res.end();
+        }
+        // Read the first block before sending success so disk errors can be returned as JSON.
+        const initial = Buffer.allocUnsafe(Math.min(info.size, 64 * 1024));
+        const { bytesRead } = await file.read(initial, 0, initial.length, 0);
+        if (bytesRead === 0) throw fail(409, '文件正在变更，请刷新后重试');
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': info.size });
+        if (bytesRead === info.size) return res.end(initial.subarray(0, bytesRead));
+        res.write(initial.subarray(0, bytesRead));
+        await pipeline(file.createReadStream({ start: bytesRead, end: info.size - 1, autoClose: false }), res);
+      } catch (error) {
+        if (error.status) throw error;
+        console.error('NAS file read failed', { code: error.code, syscall: error.syscall, started: res.headersSent });
+        throw fail(503, 'Windows 无法读取该网盘文件，请在电脑上检查 E 盘或重新上传此文件');
+      } finally {
+        await file.close();
+      }
+      return;
     }
     if (route === 'DELETE /api/file') {
       const destination = await resolve(names);

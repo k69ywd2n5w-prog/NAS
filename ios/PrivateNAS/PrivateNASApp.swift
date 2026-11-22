@@ -200,7 +200,13 @@ private final class Drive: ObservableObject {
         let request = try request("GET", "file", path: path)
         let (temporary, response) = try await session.download(for: request)
         defer { try? files.removeItem(at: temporary) }
-        try check(response)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let body = try? FileHandle(forReadingFrom: temporary)
+            defer { try? body?.close() }
+            try check(response, try? body?.read(upToCount: 4096))
+        } else {
+            try check(response)
+        }
         if selectedFolder != nil {
             do { try files.copyItem(at: temporary, to: file) }
             catch let error as CocoaError where error.code == .fileWriteFileExists { throw conflict }
