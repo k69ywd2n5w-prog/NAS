@@ -122,7 +122,24 @@ try {
         Write-Host '已为专用网络开放网盘端口。'
         exit 0
     }
-    if (!(Test-Path -LiteralPath (Join-Path $config 'account.json'))) { Set-Owner }
+    $accountFile = Join-Path $config 'account.json'
+    $listener = Get-NetTCPConnection -LocalPort 8787 -State Listen -ErrorAction SilentlyContinue
+    if ($listener) {
+        Write-Host '8787 端口已在使用。若网盘已经运行，直接从手机连接即可。'
+    }
+    if (Test-Path -LiteralPath $accountFile) {
+        $account = Get-Content -LiteralPath $accountFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        Write-Host "使用已设置的网盘账号：$($account.username)"
+    } elseif ($listener) {
+        exit 0
+    } else {
+        Write-Host "当前 Windows 用户：$([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+        Write-Host "没有找到网盘账号：$accountFile"
+        if ((Read-Host '只有在这台电脑首次配置时才需要新建账号。输入 Y 继续，或按回车退出') -ne 'Y') {
+            exit 0
+        }
+        Set-Owner
+    }
     $sha = [Security.Cryptography.SHA256]::Create()
     try { $fingerprint = [BitConverter]::ToString($sha.ComputeHash([byte[]](Set-Certificate))).Replace('-', '') }
     finally { $sha.Dispose() }
@@ -131,10 +148,7 @@ try {
     Get-NetIPConfiguration | Where-Object IPv4DefaultGateway | ForEach-Object {
         foreach ($address in $_.IPv4Address) { Write-Host "连接地址：https://$($address.IPAddress):8787" }
     }
-    if (Get-NetTCPConnection -LocalPort 8787 -State Listen -ErrorAction SilentlyContinue) {
-        Write-Host '8787 端口已在使用。若网盘已经运行，直接从手机连接即可。'
-        exit 0
-    }
+    if ($listener) { exit 0 }
     Write-Host '保持此窗口打开。按 Ctrl+C 停止服务。'
     & $node $source
     exit $LASTEXITCODE
