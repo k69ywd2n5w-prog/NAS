@@ -93,7 +93,10 @@ function Set-Certificate {
         $env:NAS_TLS_PFX_PASSWORD = PlainText $secret
         $identity = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
             $pfx, $env:NAS_TLS_PFX_PASSWORD, [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet)
-        try { return $identity.RawData }
+        try {
+            [IO.File]::WriteAllBytes((Join-Path $config 'portable.cer'), $identity.RawData)
+            return $identity.RawData
+        }
         finally { $identity.Dispose() }
     } finally { $secret.Dispose() }
 }

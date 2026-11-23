@@ -4,11 +4,11 @@ Windows 服务端把文件保存在 `E:\PrivateNAS`。iPhone 客户端支持账�
 
 ## Windows
 
-这台电脑桌面的「私人网盘.exe」可以双击启动服务。窗口会显示运行状态，关闭窗口后服务继续在后台运行。电脑重启后可再次双击。需要重新生成桌面程序时，在项目根目录运行 `./server/Build-DesktopLauncher.ps1`。程序使用本机的 Node.js 和项目中的服务端脚本。
+桌面的「私人网盘.exe」内嵌启动脚本、服务端和图标。只复制这一个 EXE 就能在另一台 64 位 Windows 使用。双击后会显示状态，如果服务尚未运行，会打开控制台引导启动。由 EXE 启动服务时，请保持控制台打开。已有本机配置会直接复用，首次安装则会引导设置账号和证书。电脑未装 Node.js 22 或更新版本时，首次运行会联网下载便携运行时。需要重新生成 EXE 时，在项目根目录运行 `./server/Build-DesktopLauncher.ps1`。
 
 也可以只复制 `PrivateNAS.bat` 到另一台 64 位 Windows。BAT 内嵌 Windows 启动脚本和服务端源码。已有 Node.js 22 或更新版本时直接使用，否则首次启动会从 Node.js 官方站点下载便携运行时并检查 SHA‑256。首次运行会引导设置账号，并在本机生成证书，随后显示局域网地址和证书指纹。文件默认放在 `E:\PrivateNAS`，没有 E 盘时使用 `%USERPROFILE%\PrivateNAS-Files`。运行 BAT 时请保持窗口打开。
 
-如果另一台设备无法连接，在管理员终端运行 `.\PrivateNAS.bat --firewall`，允许专用网络的本地子网访问 TCP 8787。然后在 iPhone App 里通过「新增服务器」填写 BAT 显示的地址和指纹。修改服务端或便携启动脚本后，运行 `./server/Build-PortableLauncher.ps1` 重新生成 BAT。
+如果另一台设备无法连接，在管理员终端运行 `.\私人网盘.exe --firewall`（BAT 版使用 `.\PrivateNAS.bat --firewall`），允许专用网络的本地子网访问 TCP 8787。然后在 iPhone App 里通过「新增服务器」填写控制台显示的地址和指纹。修改服务端或便携启动脚本后，运行对应的构建脚本重新生成 EXE 或 BAT。
 
 现有电脑可使用已找到的 Node.js 运行时。其他电脑需要 Node.js 22 或更新版本，并用 PowerShell 7 生成证书。以下命令在项目根目录执行。
 

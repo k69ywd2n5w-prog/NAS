@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -10,8 +11,8 @@ using System.Windows.Forms;
 internal sealed class DesktopLauncher : Form
 {
     private const string HealthUrl = "https://127.0.0.1:8787/health";
-    private readonly string node;
-    private readonly string server;
+    private static readonly string Config = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PrivateNAS");
     private readonly Label status = new Label();
     private readonly Button start = new Button();
     private readonly Timer timer = new Timer();
@@ -24,20 +25,46 @@ internal sealed class DesktopLauncher : Form
         ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        var window = new DesktopLauncher();
         if (args.Length == 1 && args[0] == "--check") {
-            Environment.ExitCode = window.IsOnline() ? 0 : 1;
+            using (var process = RunPortable("--check", true)) {
+                process.WaitForExit();
+                Environment.ExitCode = process.ExitCode;
+            }
             return;
         }
-        Application.Run(window);
+        if (args.Length == 1 && args[0] == "--firewall") {
+            using (RunPortable("--firewall", false)) { }
+            return;
+        }
+        Application.Run(new DesktopLauncher());
+    }
+
+    private static Process RunPortable(string mode, bool hidden)
+    {
+        byte[] payload;
+        using (var resource = typeof(DesktopLauncher).Assembly.GetManifestResourceStream("PrivateNAS.bat"))
+        using (var output = new MemoryStream()) {
+            resource.CopyTo(output);
+            payload = output.ToArray();
+        }
+        string version;
+        using (var sha = SHA256.Create()) version = BitConverter.ToString(sha.ComputeHash(payload)).Replace("-", "");
+        var folder = Path.Combine(Config, "launcher");
+        Directory.CreateDirectory(folder);
+        var batch = Path.Combine(folder, version + ".bat");
+        if (!File.Exists(batch)) File.WriteAllBytes(batch, payload);
+        var info = new ProcessStartInfo {
+            FileName = Path.Combine(Environment.SystemDirectory, "cmd.exe"),
+            Arguments = "/d /s /c \"\"%PRIVATE_NAS_EXE_BATCH%\" " + mode + "\"",
+            WorkingDirectory = folder,
+            UseShellExecute = false, CreateNoWindow = hidden
+        };
+        info.EnvironmentVariables["PRIVATE_NAS_EXE_BATCH"] = batch;
+        return Process.Start(info);
     }
 
     private DesktopLauncher()
     {
-        using (var settings = new StreamReader(typeof(DesktopLauncher).Assembly.GetManifestResourceStream("paths.txt"))) {
-            node = settings.ReadLine();
-            server = settings.ReadLine();
-        }
         Text = "私人网盘";
         Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         StartPosition = FormStartPosition.CenterScreen;
@@ -56,7 +83,9 @@ internal sealed class DesktopLauncher : Form
         var folder = new Button { Text = "打开网盘文件夹" };
         folder.SetBounds(180, 145, 164, 36);
         folder.Click += (sender, args) => {
-            if (Directory.Exists(@"E:\PrivateNAS")) Process.Start("explorer.exe", @"E:\PrivateNAS");
+            string folderPath = Directory.Exists(@"E:\") ? @"E:\PrivateNAS" :
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "PrivateNAS-Files");
+            if (Directory.Exists(folderPath)) Process.Start("explorer.exe", "\"" + folderPath + "\"");
         };
         Controls.AddRange(new Control[] { heading, status, start, folder });
         timer.Interval = 2500;
@@ -73,11 +102,7 @@ internal sealed class DesktopLauncher : Form
         try {
             status.Text = "正在启动服务…";
             if (!await Task.Run((Func<bool>)IsOnline)) {
-                using (var process = Process.Start(new ProcessStartInfo {
-                    FileName = node, Arguments = "\"" + server + "\" --tls",
-                    WorkingDirectory = Path.GetDirectoryName(server),
-                    UseShellExecute = false, CreateNoWindow = true
-                })) {
+                using (var process = RunPortable("--exe", false)) {
                     for (int count = 0; count < 12 && !process.HasExited; count++) {
                         await Task.Delay(250);
                         if (await Task.Run((Func<bool>)IsOnline)) break;
@@ -99,8 +124,8 @@ internal sealed class DesktopLauncher : Form
         try {
             bool online = await Task.Run((Func<bool>)IsOnline);
             if (IsDisposed || launching) return;
-            status.Text = online ? "服务运行中\r\n关闭此窗口后，网盘仍在后台运行。" :
-                "服务未运行\r\n请检查 E 盘和网盘证书后重试。";
+            status.Text = online ? "服务运行中\r\n如已打开网盘控制台，请保持它运行。" :
+                "服务未运行\r\n若已打开网盘控制台，请按其中的提示操作。";
             start.Enabled = !online;
         } finally { checking = false; }
     }
@@ -108,11 +133,11 @@ internal sealed class DesktopLauncher : Form
     private bool IsOnline()
     {
         try {
-            string pem = File.ReadAllText(Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                @"PrivateNAS\server-cert.pem"));
-            string expected = Convert.ToBase64String(Convert.FromBase64String(
-                pem.Replace("-----BEGIN CERTIFICATE-----", "").Replace("-----END CERTIFICATE-----", "")));
+            var path = Path.Combine(Config, "server-cert.pem");
+            string expected = File.Exists(path)
+                ? Convert.ToBase64String(Convert.FromBase64String(File.ReadAllText(path)
+                    .Replace("-----BEGIN CERTIFICATE-----", "").Replace("-----END CERTIFICATE-----", "")))
+                : Convert.ToBase64String(File.ReadAllBytes(Path.Combine(Config, "portable.cer")));
             var request = (HttpWebRequest)WebRequest.Create(HealthUrl);
             request.Proxy = null;
             request.Timeout = 1200;

@@ -1,3 +1,4 @@
+param([switch]$PackageOnly)
 $ErrorActionPreference = 'Stop'
 $header = @'
 @echo off
@@ -30,6 +31,7 @@ try {
         ':NAS_ICON' + @([regex]::Matches($icon, '.{1,100}') | ForEach-Object { $_.Value })
     [IO.File]::WriteAllText($package, ($lines -join "`r`n") + "`r`n", [Text.Encoding]::ASCII)
 } finally { Remove-Item -LiteralPath $iconFile.FullName }
+if ($PackageOnly) { return }
 $desktop = [Environment]::GetFolderPath('DesktopDirectory')
 $desktopFile = Join-Path $desktop '私人网盘.bat'
 Copy-Item -LiteralPath $package -Destination $desktopFile -Force
