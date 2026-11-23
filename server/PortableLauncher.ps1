@@ -187,7 +187,11 @@ try {
     $sha = [Security.Cryptography.SHA256]::Create()
     try { $fingerprint = [BitConverter]::ToString($sha.ComputeHash([byte[]](Set-Certificate))).Replace('-', '') }
     finally { $sha.Dispose() }
-    Write-Host "网盘目录：$root"
+    $rootSetting = Join-Path $config 'storage-root.txt'
+    $displayRoot = if (Test-Path -LiteralPath $rootSetting) {
+        (Get-Content -LiteralPath $rootSetting -Raw -Encoding UTF8).Trim()
+    } else { $root }
+    Write-Host "网盘目录：$displayRoot"
     Write-Host "证书指纹：$fingerprint"
     Get-NetIPConfiguration | Where-Object IPv4DefaultGateway | ForEach-Object {
         foreach ($address in $_.IPv4Address) { Write-Host "连接地址：https://$($address.IPAddress):8787" }

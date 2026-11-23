@@ -13,6 +13,7 @@ const configFlag = process.argv.indexOf('--config-dir');
 const configDir = (configFlag >= 0 && process.argv[configFlag + 1]) || process.env.NAS_CONFIG ||
   path.join(process.env.LOCALAPPDATA, 'PrivateNAS');
 const accountFile = path.join(configDir, 'account.json');
+const rootSetting = path.join(configDir, 'storage-root.txt');
 const storage = process.env.NAS_ROOT || 'E:\\PrivateNAS';
 const port = Number(process.env.NAS_PORT || 8787);
 const uploadLimit = 20 * 1024 ** 3;
@@ -48,14 +49,41 @@ function parts(value) {
 
 async function serve() {
   await fs.mkdir(storage, { recursive: true });
-  const root = await fs.realpath(storage);
+  const defaultRoot = await fs.realpath(storage);
+  const protectedRoot = await fs.realpath(configDir).catch(error => {
+    if (error.code === 'ENOENT') return path.resolve(configDir);
+    throw error;
+  });
   const sessions = new Map();
   const sessionLifetime = 12 * 60 * 60 * 1000;
   let failures = [];
   let loginInProgress = false;
 
   // Resolve each existing component and reject links, including Windows junctions.
-  async function resolve(names) {
+  function contains(parent, child) {
+    const relative = path.relative(parent, child);
+    return !relative || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith('..' + path.sep));
+  }
+
+  async function activeRoot() {
+    const selected = await fs.readFile(rootSetting, 'utf8').catch(error => {
+      if (error.code === 'ENOENT') return '';
+      throw error;
+    });
+    if (!selected.trim()) return defaultRoot;
+    try {
+      const folder = selected.trim();
+      if (!path.isAbsolute(folder)) throw new Error('Storage folder must be absolute');
+      const canonical = await fs.realpath(folder);
+      if (!(await fs.stat(canonical)).isDirectory() || contains(canonical, protectedRoot) ||
+          contains(protectedRoot, canonical)) throw new Error('Storage folder conflicts with NAS configuration');
+      return canonical;
+    } catch {
+      throw fail(503, '设定的网盘目录不可用，请在 Windows 程序中重新选择');
+    }
+  }
+
+  async function resolve(root, names) {
     let current = root;
     for (const name of names) {
       current = path.join(current, name);
@@ -71,16 +99,14 @@ async function serve() {
     return current;
   }
 
-  async function transfer(route, names, targetNames) {
+  async function transfer(root, route, names, targetNames) {
     if (!targetNames.length) throw fail(400, '请选择目标位置');
-    const source = await resolve(names);
+    const source = await resolve(root, names);
     const info = await fs.lstat(source);
     if (!info.isFile() && !info.isDirectory()) throw fail(403, '无法操作此项目');
-    const parent = await resolve(targetNames.slice(0, -1));
+    const parent = await resolve(root, targetNames.slice(0, -1));
     const destination = path.join(parent, targetNames.at(-1));
-    const relative = path.relative(source, parent);
-    if (info.isDirectory() && (!relative || (!path.isAbsolute(relative) &&
-        relative !== '..' && !relative.startsWith('..' + path.sep)))) {
+    if (info.isDirectory() && contains(source, parent)) {
       throw fail(400, '不能将文件夹放进自身或其子文件夹');
     }
     const existing = await fs.lstat(destination).catch(error => {
@@ -165,7 +191,7 @@ async function serve() {
       for (const [key, session] of sessions) if (session.expires <= now) sessions.delete(key);
       if (sessions.size >= 32) sessions.delete(sessions.keys().next().value);
       const token = randomBytes(32).toString('hex');
-      sessions.set(token, { account, expires: now + sessionLifetime });
+      sessions.set(token, { account, root: await activeRoot(), expires: now + sessionLifetime });
       json(res, 200, { token });
     } finally {
       loginInProgress = false;
@@ -190,8 +216,13 @@ async function serve() {
       return json(res, 200, { ok: true });
     }
     const names = parts(url.searchParams.get('path'));
+    const root = await activeRoot();
+    if (path.relative(session.root, root)) {
+      sessions.delete(token);
+      throw fail(401, '网盘目录已切换，请重新登录');
+    }
     if (route === 'GET /api/files') {
-      const folder = await resolve(names);
+      const folder = await resolve(root, names);
       const files = [];
       for (const item of await fs.readdir(folder, { withFileTypes: true })) {
         if (!item.isFile() && !item.isDirectory()) continue;
@@ -207,11 +238,11 @@ async function serve() {
     }
     if (!names.length) throw fail(400, '请选择文件或文件夹');
     if (route === 'POST /api/copy' || route === 'POST /api/move') {
-      await transfer(route, names, parts(url.searchParams.get('destination')));
+      await transfer(root, route, names, parts(url.searchParams.get('destination')));
       return json(res, 200, { ok: true });
     }
     if (route === 'GET /api/file') {
-      const destination = await resolve(names);
+      const destination = await resolve(root, names);
       if (!(await fs.lstat(destination)).isFile()) throw fail(400, '请选择文件');
       const file = await fs.open(destination, 'r');
       try {
@@ -239,7 +270,7 @@ async function serve() {
       return;
     }
     if (route === 'DELETE /api/file') {
-      const destination = await resolve(names);
+      const destination = await resolve(root, names);
       const info = await fs.lstat(destination);
       if (url.searchParams.get('recursive') === 'true') {
         if (!info.isDirectory()) throw fail(409, '此项目已不再是文件夹，请刷新后重试');
@@ -249,7 +280,7 @@ async function serve() {
       else throw fail(403, '无法删除此项目');
       return json(res, 200, { ok: true });
     }
-    const parent = await resolve(names.slice(0, -1));
+    const parent = await resolve(root, names.slice(0, -1));
     const destination = path.join(parent, names.at(-1));
     if (route === 'POST /api/folder') {
       await fs.mkdir(destination);
@@ -302,7 +333,7 @@ async function serve() {
       json(res, status, { error: message });
     });
   });
-  server.listen(port, host, () => console.log(`PrivateNAS ${tls ? 'HTTPS' : 'HTTP'} port ${port} on ${host} → ${root}`));
+  server.listen(port, host, () => console.log(`PrivateNAS ${tls ? 'HTTPS' : 'HTTP'} port ${port} on ${host} → ${defaultRoot}`));
 }
 
 if (process.argv[2] === 'owner') await saveOwner(process.argv[3]);

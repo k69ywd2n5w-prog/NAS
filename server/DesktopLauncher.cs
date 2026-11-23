@@ -15,6 +15,8 @@ internal sealed class DesktopLauncher : Form
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PrivateNAS");
     private readonly Label status = new Label();
     private readonly Button start = new Button();
+    private readonly Button chooseFolder = new Button();
+    private readonly TextBox rootPath = new TextBox();
     private readonly TextBox username = new TextBox();
     private readonly TextBox password = new TextBox();
     private readonly FlowLayoutPanel setup = new FlowLayoutPanel();
@@ -79,26 +81,33 @@ internal sealed class DesktopLauncher : Form
         Text = "私人网盘";
         Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(480, 370);
+        ClientSize = new Size(520, 438);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 11);
 
         var heading = new Label { Text = "私人网盘服务", Font = new Font(Font, FontStyle.Bold),
             AutoSize = true, Location = new Point(24, 24) };
-        status.SetBounds(24, 65, 432, 65);
+        status.SetBounds(24, 62, 472, 48);
         status.Text = "正在检查服务…";
         start.Text = "启动服务";
-        start.SetBounds(24, 310, 142, 36);
+        start.SetBounds(24, 376, 142, 36);
         start.Click += async (sender, args) => await StartServer();
         var folder = new Button { Text = "打开网盘文件夹" };
-        folder.SetBounds(180, 310, 164, 36);
+        folder.SetBounds(180, 376, 164, 36);
         folder.Click += (sender, args) => {
-            string folderPath = Directory.Exists(@"E:\") ? @"E:\PrivateNAS" :
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "PrivateNAS-Files");
+            string folderPath = rootPath.Text;
             if (Directory.Exists(folderPath)) Process.Start("explorer.exe", "\"" + folderPath + "\"");
+            else ShowDetails("网盘目录不存在，请重新选择。");
         };
-        setup.SetBounds(24, 135, 432, 65);
+        var rootLabel = new Label { Text = "网盘目录", AutoSize = true, Location = new Point(24, 115) };
+        rootPath.SetBounds(24, 143, 330, 32);
+        rootPath.ReadOnly = true;
+        rootPath.Text = ReadStorageRoot();
+        chooseFolder.Text = "选择文件夹…";
+        chooseFolder.SetBounds(366, 140, 130, 34);
+        chooseFolder.Click += (sender, args) => ChooseStorageRoot();
+        setup.SetBounds(24, 188, 472, 65);
         setup.WrapContents = true;
         setup.Controls.Add(new Label { Text = "网盘用户名", Width = 104 });
         username.Width = 300;
@@ -108,12 +117,12 @@ internal sealed class DesktopLauncher : Form
         password.UseSystemPasswordChar = true;
         setup.Controls.Add(password);
         setup.Visible = !File.Exists(Path.Combine(Config, "account.json"));
-        details.SetBounds(24, 205, 432, 85);
+        details.SetBounds(24, 262, 472, 92);
         details.Multiline = true;
         details.ReadOnly = true;
         details.ScrollBars = ScrollBars.Vertical;
         details.Visible = false;
-        Controls.AddRange(new Control[] { heading, status, setup, details, start, folder });
+        Controls.AddRange(new Control[] { heading, status, rootLabel, rootPath, chooseFolder, setup, details, start, folder });
         timer.Interval = 2500;
         timer.Tick += async (sender, args) => await RefreshStatus();
         Shown += async (sender, args) => {
@@ -122,6 +131,56 @@ internal sealed class DesktopLauncher : Form
             else await StartServer();
         };
         FormClosed += (sender, args) => timer.Dispose();
+    }
+
+    private static string RootSetting { get { return Path.Combine(Config, "storage-root.txt"); } }
+
+    private static string ReadStorageRoot()
+    {
+        try {
+            if (File.Exists(RootSetting)) {
+                string selected = File.ReadAllText(RootSetting).Trim();
+                if (!string.IsNullOrEmpty(selected)) return selected;
+            }
+        } catch (IOException) { }
+        return Directory.Exists(@"E:\") ? @"E:\PrivateNAS" :
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "PrivateNAS-Files");
+    }
+
+    private void ShowDetails(string message)
+    {
+        details.Text = message;
+        details.Visible = true;
+    }
+
+    private void ChooseStorageRoot()
+    {
+        using (var picker = new FolderBrowserDialog {
+            Description = "选择要作为网盘根目录的文件夹", SelectedPath = rootPath.Text, ShowNewFolderButton = true
+        }) {
+            if (picker.ShowDialog(this) != DialogResult.OK) return;
+            try {
+                string selected = Path.GetFullPath(picker.SelectedPath);
+                if (string.Equals(selected, rootPath.Text, StringComparison.OrdinalIgnoreCase)) return;
+                if (!Directory.Exists(selected)) throw new IOException("所选文件夹不存在。");
+                string folderPrefix = selected.TrimEnd('\\') + "\\";
+                string configPrefix = Config.TrimEnd('\\') + "\\";
+                if (configPrefix.StartsWith(folderPrefix, StringComparison.OrdinalIgnoreCase) ||
+                    folderPrefix.StartsWith(configPrefix, StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("该目录与网盘配置目录重叠，请选择一个独立的文件夹。");
+                if (MessageBox.Show(this, "将此目录作为手机端的网盘根目录？\r\n\r\n" + selected,
+                    "切换网盘目录", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+                Directory.CreateDirectory(Config);
+                string temp = Path.Combine(Config, Guid.NewGuid().ToString("N") + ".tmp");
+                try {
+                    File.WriteAllText(temp, selected, new UTF8Encoding(false));
+                    if (File.Exists(RootSetting)) File.Replace(temp, RootSetting, null);
+                    else File.Move(temp, RootSetting);
+                } finally { if (File.Exists(temp)) File.Delete(temp); }
+                rootPath.Text = selected;
+                ShowDetails("网盘目录已保存。如果手机已连接，请重新登录。");
+            } catch (Exception error) { ShowDetails(error.Message); }
+        }
     }
 
     private async Task StartServer()
@@ -134,6 +193,7 @@ internal sealed class DesktopLauncher : Form
         }
         launching = true;
         start.Enabled = false;
+        chooseFolder.Enabled = false;
         try {
             status.Text = "正在启动服务…";
             if (!await Task.Run((Func<bool>)IsOnline)) {
@@ -165,6 +225,7 @@ internal sealed class DesktopLauncher : Form
             }
         } finally {
             launching = false;
+            if (!IsDisposed) chooseFolder.Enabled = true;
         }
         await RefreshStatus();
     }
