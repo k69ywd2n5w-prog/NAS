@@ -4,6 +4,8 @@ Windows 服务端把文件保存在 `E:\PrivateNAS`。iPhone 客户端支持账�
 
 ## Windows
 
+这台电脑桌面的「私人网盘.exe」可以双击启动服务。窗口会显示运行状态，关闭窗口后服务继续在后台运行。电脑重启后可再次双击。需要重新生成桌面程序时，在项目根目录运行 `./server/Build-DesktopLauncher.ps1`。程序使用本机的 Node.js 和项目中的服务端脚本。
+
 现有电脑可使用已找到的 Node.js 运行时。其他电脑需要 Node.js 22 或更新版本，并用 PowerShell 7 生成证书。以下命令在项目根目录执行。
 
 ```powershell
