@@ -285,9 +285,12 @@ async function serve() {
   const cert = process.env.NAS_TLS_CERT || (process.argv.includes('--tls') && path.join(configDir, 'server-cert.pem'));
   const key = process.env.NAS_TLS_KEY || (process.argv.includes('--tls') && path.join(configDir, 'server-key.pem'));
   if (Boolean(cert) !== Boolean(key)) throw new Error('Set both NAS_TLS_CERT and NAS_TLS_KEY');
-  const host = cert ? (process.env.NAS_BIND || '0.0.0.0') : '127.0.0.1';
-  const server = cert
-    ? https.createServer({ ...options, cert: await fs.readFile(cert), key: await fs.readFile(key), minVersion: 'TLSv1.2' })
+  const pfx = process.env.NAS_TLS_PFX;
+  const tls = pfx ? { pfx: await fs.readFile(pfx), passphrase: process.env.NAS_TLS_PFX_PASSWORD }
+    : cert ? { cert: await fs.readFile(cert), key: await fs.readFile(key) } : null;
+  const host = tls ? (process.env.NAS_BIND || '0.0.0.0') : '127.0.0.1';
+  const server = tls
+    ? https.createServer({ ...options, ...tls, minVersion: 'TLSv1.2' })
     : http.createServer(options);
   server.on('request', (req, res) => {
     handle(req, res).catch(error => {
@@ -299,7 +302,7 @@ async function serve() {
       json(res, status, { error: message });
     });
   });
-  server.listen(port, host, () => console.log(`PrivateNAS ${cert ? 'HTTPS' : 'HTTP'} port ${port} on ${host} → ${root}`));
+  server.listen(port, host, () => console.log(`PrivateNAS ${tls ? 'HTTPS' : 'HTTP'} port ${port} on ${host} → ${root}`));
 }
 
 if (process.argv[2] === 'owner') await saveOwner(process.argv[3]);
