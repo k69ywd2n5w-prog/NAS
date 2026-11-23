@@ -98,9 +98,36 @@ function Set-Certificate {
     } finally { $secret.Dispose() }
 }
 
+function Install-DesktopShortcut {
+    $encoded = [regex]::Match($nasBatchText, '(?ms)^:NAS_ICON\r?\n(.*)\z').Groups[1].Value
+    if (!$encoded) { throw 'The embedded app icon is missing.' }
+    $iconPath = Join-Path $app 'PrivateNAS.ico'
+    [IO.File]::WriteAllBytes($iconPath, [Convert]::FromBase64String($encoded))
+    $desktop = [Environment]::GetFolderPath('DesktopDirectory')
+    if (!$desktop) { return }
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcutPath = Join-Path $desktop '私人网盘（便携版）.lnk'
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    if ($shortcut.TargetPath -and $shortcut.TargetPath -ne $env:NAS_BATCH_FILE) {
+        return
+    }
+    $shortcut.TargetPath = $env:NAS_BATCH_FILE
+    $shortcut.WorkingDirectory = Split-Path $env:NAS_BATCH_FILE -Parent
+    $shortcut.IconLocation = "$iconPath,0"
+    $shortcut.Save()
+}
+
 try {
     New-Item -ItemType Directory -Path $app -Force | Out-Null
-    $payload = [regex]::Match($nasBatchText, '(?ms)^:NAS_SERVER\r?\n(.*)\z').Groups[1].Value
+    if ($env:NAS_BATCH_MODE -eq '--icon') {
+        Install-DesktopShortcut
+        exit 0
+    }
+    if (!$env:NAS_BATCH_MODE) {
+        try { Install-DesktopShortcut }
+        catch { Write-Warning '无法创建桌面快捷方式，网盘仍可启动。' }
+    }
+    $payload = [regex]::Match($nasBatchText, '(?ms)^:NAS_SERVER\r?\n(.*?)^:NAS_ICON\r?$').Groups[1].Value
     if (!$payload) { throw 'The embedded NAS server is missing.' }
     [IO.File]::WriteAllBytes($source, [Convert]::FromBase64String($payload))
     $node = Get-NodeRuntime
