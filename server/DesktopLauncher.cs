@@ -15,6 +15,10 @@ internal sealed class DesktopLauncher : Form
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PrivateNAS");
     private readonly Label status = new Label();
     private readonly Button start = new Button();
+    private readonly TextBox username = new TextBox();
+    private readonly TextBox password = new TextBox();
+    private readonly FlowLayoutPanel setup = new FlowLayoutPanel();
+    private readonly TextBox details = new TextBox();
     private readonly Timer timer = new Timer();
     private bool checking;
     private bool launching;
@@ -60,6 +64,13 @@ internal sealed class DesktopLauncher : Form
             UseShellExecute = false, CreateNoWindow = hidden
         };
         info.EnvironmentVariables["PRIVATE_NAS_EXE_BATCH"] = batch;
+        if (mode == "--gui") {
+            info.RedirectStandardInput = true;
+            info.RedirectStandardOutput = true;
+            info.RedirectStandardError = true;
+            info.StandardOutputEncoding = Encoding.UTF8;
+            info.StandardErrorEncoding = Encoding.UTF8;
+        }
         return Process.Start(info);
     }
 
@@ -68,49 +79,90 @@ internal sealed class DesktopLauncher : Form
         Text = "私人网盘";
         Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(440, 210);
+        ClientSize = new Size(480, 370);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 11);
 
         var heading = new Label { Text = "私人网盘服务", Font = new Font(Font, FontStyle.Bold),
             AutoSize = true, Location = new Point(24, 24) };
-        status.SetBounds(24, 65, 392, 62);
+        status.SetBounds(24, 65, 432, 65);
         status.Text = "正在检查服务…";
         start.Text = "启动服务";
-        start.SetBounds(24, 145, 142, 36);
+        start.SetBounds(24, 310, 142, 36);
         start.Click += async (sender, args) => await StartServer();
         var folder = new Button { Text = "打开网盘文件夹" };
-        folder.SetBounds(180, 145, 164, 36);
+        folder.SetBounds(180, 310, 164, 36);
         folder.Click += (sender, args) => {
             string folderPath = Directory.Exists(@"E:\") ? @"E:\PrivateNAS" :
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "PrivateNAS-Files");
             if (Directory.Exists(folderPath)) Process.Start("explorer.exe", "\"" + folderPath + "\"");
         };
-        Controls.AddRange(new Control[] { heading, status, start, folder });
+        setup.SetBounds(24, 135, 432, 65);
+        setup.WrapContents = true;
+        setup.Controls.Add(new Label { Text = "网盘用户名", Width = 104 });
+        username.Width = 300;
+        setup.Controls.Add(username);
+        setup.Controls.Add(new Label { Text = "网盘密码", Width = 104 });
+        password.Width = 300;
+        password.UseSystemPasswordChar = true;
+        setup.Controls.Add(password);
+        setup.Visible = !File.Exists(Path.Combine(Config, "account.json"));
+        details.SetBounds(24, 205, 432, 85);
+        details.Multiline = true;
+        details.ReadOnly = true;
+        details.ScrollBars = ScrollBars.Vertical;
+        details.Visible = false;
+        Controls.AddRange(new Control[] { heading, status, setup, details, start, folder });
         timer.Interval = 2500;
         timer.Tick += async (sender, args) => await RefreshStatus();
-        Shown += async (sender, args) => { timer.Start(); await StartServer(); };
+        Shown += async (sender, args) => {
+            timer.Start();
+            if (setup.Visible) await RefreshStatus();
+            else await StartServer();
+        };
         FormClosed += (sender, args) => timer.Dispose();
     }
 
     private async Task StartServer()
     {
         if (launching) return;
+        if (setup.Visible && (string.IsNullOrWhiteSpace(username.Text) ||
+            password.Text.Length < 8 || password.Text.Length > 12)) {
+            status.Text = "请输入网盘用户名和 8–12 位密码。";
+            return;
+        }
         launching = true;
         start.Enabled = false;
         try {
             status.Text = "正在启动服务…";
             if (!await Task.Run((Func<bool>)IsOnline)) {
-                using (var process = RunPortable("--exe", false)) {
-                    for (int count = 0; count < 12 && !process.HasExited; count++) {
-                        await Task.Delay(250);
-                        if (await Task.Run((Func<bool>)IsOnline)) break;
+                using (var process = RunPortable("--gui", true)) {
+                    var output = process.StandardOutput.ReadToEndAsync();
+                    var errors = process.StandardError.ReadToEndAsync();
+                    using (var input = process.StandardInput) {
+                        if (setup.Visible) {
+                            var bytes = Encoding.UTF8.GetBytes(username.Text.Trim() + "\n" + password.Text + "\n");
+                            try { input.BaseStream.Write(bytes, 0, bytes.Length); }
+                            finally { Array.Clear(bytes, 0, bytes.Length); password.Clear(); }
+                        }
+                    }
+                    await Task.Run(() => process.WaitForExit());
+                    string message = (await output + await errors).Trim();
+                    if (!IsDisposed) {
+                        details.Text = message;
+                        setup.Visible = !File.Exists(Path.Combine(Config, "account.json"));
+                        if (process.ExitCode != 0 && details.Text.Length == 0)
+                            details.Text = "启动失败，请检查网盘配置。";
+                        details.Visible = !string.IsNullOrWhiteSpace(details.Text);
                     }
                 }
             }
         } catch (Exception error) {
-            MessageBox.Show(error.Message, "启动网盘失败");
+            if (!IsDisposed) {
+                details.Text = error.Message;
+                details.Visible = true;
+            }
         } finally {
             launching = false;
         }
@@ -124,8 +176,9 @@ internal sealed class DesktopLauncher : Form
         try {
             bool online = await Task.Run((Func<bool>)IsOnline);
             if (IsDisposed || launching) return;
-            status.Text = online ? "服务运行中\r\n如已打开网盘控制台，请保持它运行。" :
-                "服务未运行\r\n若已打开网盘控制台，请按其中的提示操作。";
+            setup.Visible = !online && !File.Exists(Path.Combine(Config, "account.json"));
+            status.Text = online ? "服务运行中\r\n关闭此窗口后，网盘仍在后台运行。" :
+                setup.Visible ? "首次使用，请设置网盘账号后点击启动。" : "服务未运行";
             start.Enabled = !online;
         } finally { checking = false; }
     }

@@ -8,7 +8,7 @@ set "NAS_BATCH_MODE=%~1"
 set "PSModulePath="
 "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Command "$ErrorActionPreference='Stop'; $nasBatchText=[IO.File]::ReadAllText($env:NAS_BATCH_FILE); $payload=[regex]::Match($nasBatchText,'(?ms)^:NAS_BOOT\r?\n(.*?)^:NAS_SERVER\r?$').Groups[1].Value; & ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload))))"
 set "NAS_RESULT=%ERRORLEVEL%"
-if /I not "%NAS_BATCH_MODE%"=="--check" if /I not "%NAS_BATCH_MODE%"=="--icon" pause
+if /I not "%NAS_BATCH_MODE%"=="--check" if /I not "%NAS_BATCH_MODE%"=="--icon" if /I not "%NAS_BATCH_MODE%"=="--gui" pause
 exit /b %NAS_RESULT%
 '@
 

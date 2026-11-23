@@ -1,4 +1,5 @@
 $ErrorActionPreference = 'Stop'
+if ($env:NAS_BATCH_MODE -eq '--gui') { [Console]::OutputEncoding = [Text.Encoding]::UTF8 }
 $config = Join-Path $env:LOCALAPPDATA 'PrivateNAS'
 $app = Join-Path $config 'portable'
 $source = Join-Path $app 'nas.mjs'
@@ -45,6 +46,16 @@ function Get-NodeRuntime {
 }
 
 function Set-Owner {
+    if ($env:NAS_BATCH_MODE -eq '--gui') {
+        [Console]::InputEncoding = [Text.Encoding]::UTF8
+        $name = [Console]::ReadLine()
+        $entered = [Console]::ReadLine()
+        if ($name -cnotmatch '^[\p{L}\p{Nd}_-]{1,32}\z' -or !$entered -or $entered.Length -lt 8 -or $entered.Length -gt 12) {
+            throw '请输入有效的用户名和 8–12 位密码。'
+        }
+        $password = ConvertTo-SecureString $entered -AsPlainText -Force
+        $entered = $null
+    } else {
     do { $name = (Read-Host '设置网盘用户名（1–32 个字母、数字、下划线或连字符）').Trim() }
     until ($name -cmatch '^[\p{L}\p{Nd}_-]{1,32}\z')
     do {
@@ -53,6 +64,7 @@ function Set-Owner {
         $password.Dispose()
         Write-Warning '请输入 8–12 个字符。'
     } while ($true)
+    }
     $process = [Diagnostics.Process]::new()
     try {
         $process.StartInfo.FileName = $node
@@ -162,6 +174,8 @@ try {
         Write-Host "使用已设置的网盘账号：$($account.username)"
     } elseif ($listener) {
         exit 0
+    } elseif ($env:NAS_BATCH_MODE -eq '--gui') {
+        Set-Owner
     } else {
         Write-Host "当前 Windows 用户：$([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
         Write-Host "没有找到网盘账号：$accountFile"
@@ -179,6 +193,12 @@ try {
         foreach ($address in $_.IPv4Address) { Write-Host "连接地址：https://$($address.IPAddress):8787" }
     }
     if ($listener) { exit 0 }
+    if ($env:NAS_BATCH_MODE -eq '--gui') {
+        Start-Process -FilePath $node -ArgumentList ('"{0}"' -f $source) -WindowStyle Hidden `
+            -RedirectStandardOutput (Join-Path $config 'service.log') `
+            -RedirectStandardError (Join-Path $config 'service-error.log')
+        exit 0
+    }
     Write-Host '保持此窗口打开。按 Ctrl+C 停止服务。'
     & $node $source
     exit $LASTEXITCODE
