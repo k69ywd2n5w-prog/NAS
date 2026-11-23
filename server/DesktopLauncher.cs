@@ -39,6 +39,7 @@ internal sealed class DesktopLauncher : Form
             server = settings.ReadLine();
         }
         Text = "私人网盘";
+        Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         StartPosition = FormStartPosition.CenterScreen;
         ClientSize = new Size(440, 210);
         FormBorderStyle = FormBorderStyle.FixedDialog;
