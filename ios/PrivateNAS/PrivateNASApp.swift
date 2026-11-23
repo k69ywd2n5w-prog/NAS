@@ -1,4 +1,3 @@
-import CryptoKit
 import CoreTransferable
 import PhotosUI
 import QuickLook
@@ -8,7 +7,7 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
-private struct Entry: Decodable, Identifiable {
+struct Entry: Decodable, Identifiable {
     let name: String
     let directory: Bool
     let size: Int64
@@ -40,8 +39,9 @@ private struct ClipboardItem {
     var name: String { path[path.count - 1] }
 }
 
-private struct APIError: LocalizedError {
+struct APIError: LocalizedError {
     let message: String
+    var status: Int? = nil
     var errorDescription: String? { message }
 }
 
@@ -69,34 +69,7 @@ private struct PhotoFile: Transferable {
     }
 }
 
-private final class ServerTrust: NSObject, URLSessionTaskDelegate, Sendable {
-    let fingerprint: String
-
-    init(fingerprint: String) { self.fingerprint = fingerprint }
-
-    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
-                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-              !fingerprint.isEmpty else {
-            completionHandler(.performDefaultHandling, nil)
-            return
-        }
-        // The fingerprint is copied from the owner's Windows console through a trusted channel.
-        guard let trust = challenge.protectionSpace.serverTrust,
-              let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate],
-              let leaf = chain.first,
-              SHA256.hash(data: SecCertificateCopyData(leaf) as Data)
-                .map({ String(format: "%02x", $0) }).joined() == fingerprint,
-              SecTrustSetPolicies(trust, SecPolicyCreateBasicX509()) == errSecSuccess,
-              SecTrustSetAnchorCertificates(trust, [leaf] as CFArray) == errSecSuccess,
-              SecTrustSetAnchorCertificatesOnly(trust, true) == errSecSuccess,
-              SecTrustEvaluateWithError(trust, nil) else {
-            completionHandler(.cancelAuthenticationChallenge, nil)
-            return
-        }
-        completionHandler(.useCredential, URLCredential(trust: trust))
-    }
-
+private final class RedirectGuard: NSObject, URLSessionTaskDelegate, Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask,
                     willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
                     completionHandler: @escaping (URLRequest?) -> Void) {
@@ -105,10 +78,11 @@ private final class ServerTrust: NSObject, URLSessionTaskDelegate, Sendable {
 }
 
 @MainActor
-private final class Drive: ObservableObject {
+final class Drive: ObservableObject {
     @Published var token: String?
-    @Published var clipboard: ClipboardItem?
+    @Published fileprivate var clipboard: ClipboardItem?
     private var base: URL?
+    private var accountName: String?
     private var session: URLSession?
     private let thumbnails: NSCache<NSString, UIImage> = {
         let cache = NSCache<NSString, UIImage>()
@@ -116,27 +90,24 @@ private final class Drive: ObservableObject {
         return cache
     }()
 
-    func login(address: String, fingerprint: String, username: String, password: String) async throws {
+    func login(address: String, username: String, password: String) async throws {
         guard let url = URL(string: address.trimmingCharacters(in: .whitespacesAndNewlines)),
               url.scheme?.lowercased() == "https", url.host != nil,
               url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
               url.path.isEmpty || url.path == "/" else {
             throw APIError(message: "请输入 HTTPS 服务器地址，例如 https://nas.example.com:8787")
         }
-        let pin = fingerprint.filter { !$0.isWhitespace && $0 != ":" }.lowercased()
-        guard pin.isEmpty || pin.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil else {
-            throw APIError(message: "证书指纹应为 64 个十六进制字符")
-        }
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForResource = 3600
         session?.invalidateAndCancel()
-        session = URLSession(configuration: config, delegate: ServerTrust(fingerprint: pin), delegateQueue: nil)
+        session = URLSession(configuration: config, delegate: RedirectGuard(), delegateQueue: nil)
         base = url
         var request = try request("POST", "login")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(["username": username, "password": password])
         struct Login: Decodable { let token: String }
         token = try JSONDecoder().decode(Login.self, from: await send(request)).token
+        accountName = username
     }
 
     func logout() async {
@@ -149,7 +120,8 @@ private final class Drive: ObservableObject {
     }
 
     private func request(_ method: String, _ action: String, path: [String] = [],
-                         recursive: Bool = false, destination: [String]? = nil) throws -> URLRequest {
+                         recursive: Bool = false, destination: [String]? = nil,
+                         parameters: [URLQueryItem] = []) throws -> URLRequest {
         guard let base else { throw APIError(message: "请先登录") }
         let endpoint = base.appendingPathComponent("api").appendingPathComponent(action)
         var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)!
@@ -159,6 +131,7 @@ private final class Drive: ObservableObject {
             if let destination {
                 query.append(URLQueryItem(name: "destination", value: destination.joined(separator: "/")))
             }
+            query.append(contentsOf: parameters)
             components.queryItems = query
             components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         }
@@ -178,7 +151,7 @@ private final class Drive: ObservableObject {
             }
             struct Failure: Decodable { let error: String }
             let message = data.flatMap { try? JSONDecoder().decode(Failure.self, from: $0).error }
-            throw APIError(message: message ?? "请求失败（\(http.statusCode)）")
+            throw APIError(message: message ?? "请求失败（\(http.statusCode)）", status: http.statusCode)
         }
     }
 
@@ -187,6 +160,23 @@ private final class Drive: ObservableObject {
         let (data, response) = try await session.data(for: request)
         try check(response, data)
         return data
+    }
+
+    func transferScope() async throws -> String {
+        guard let base, let accountName, token != nil else { throw APIError(message: "请先登录") }
+        struct Root: Decodable { let id: String }
+        let root = try JSONDecoder().decode(Root.self, from: await send(request("GET", "transfer-root")))
+        return "\(base.absoluteString)\n\(accountName)\n\(root.id)"
+    }
+
+    func transferData(_ method: String, _ action: String, path: [String],
+                      values: [String: String], body: Data? = nil) async throws -> Data {
+        guard token != nil else { throw APIError(message: "请重新登录后继续传输") }
+        let query = values.map { URLQueryItem(name: $0.key, value: $0.value) }
+        var operation = try request(method, action, path: path, parameters: query)
+        operation.httpBody = body
+        if body != nil { operation.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type") }
+        return try await send(operation)
     }
 
     func list(_ path: [String]) async throws -> [Entry] {
@@ -202,29 +192,16 @@ private final class Drive: ObservableObject {
         _ = try await send(request("DELETE", "file", path: path, recursive: directory))
     }
 
-    func transfer(_ item: ClipboardItem, to destination: [String]) async throws {
+    fileprivate func transfer(_ item: ClipboardItem, to destination: [String]) async throws {
         let action = item.move ? "move" : "copy"
         _ = try await send(request("POST", action, path: item.path, destination: destination))
     }
 
-    func upload(_ file: URL, to path: [String]) async throws {
-        guard let session else { throw APIError(message: "请先登录") }
-        let accessed = file.startAccessingSecurityScopedResource()
-        defer { if accessed { file.stopAccessingSecurityScopedResource() } }
-        let request = try request("PUT", "file", path: path + [file.lastPathComponent])
-        let (data, response) = try await session.upload(for: request, fromFile: file)
-        try check(response, data)
-    }
-
-    func download(_ path: [String], into selectedFolder: URL? = nil) async throws -> URL {
+    func download(_ path: [String]) async throws -> URL {
         guard let session, let name = path.last else { throw APIError(message: "请选择文件") }
         let files = FileManager.default
-        let accessed = selectedFolder?.startAccessingSecurityScopedResource() ?? false
-        defer { if accessed { selectedFolder?.stopAccessingSecurityScopedResource() } }
-        let folder = selectedFolder ?? files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let folder = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let file = folder.appendingPathComponent(name)
-        let conflict = APIError(message: "保存位置已有同名文件，请选择其他位置")
-        if selectedFolder != nil && files.fileExists(atPath: file.path) { throw conflict }
         let request = try request("GET", "file", path: path)
         let (temporary, response) = try await session.download(for: request)
         defer { try? files.removeItem(at: temporary) }
@@ -235,16 +212,11 @@ private final class Drive: ObservableObject {
         } else {
             try check(response)
         }
-        if selectedFolder != nil {
-            do { try files.copyItem(at: temporary, to: file) }
-            catch let error as CocoaError where error.code == .fileWriteFileExists { throw conflict }
-        } else {
-            try files.createDirectory(at: folder, withIntermediateDirectories: true)
-            do { try files.moveItem(at: temporary, to: file) }
-            catch {
-                try? files.removeItem(at: folder)
-                throw error
-            }
+        try files.createDirectory(at: folder, withIntermediateDirectories: true)
+        do { try files.moveItem(at: temporary, to: file) }
+        catch {
+            try? files.removeItem(at: folder)
+            throw error
         }
         return file
     }
@@ -273,6 +245,7 @@ private final class Drive: ObservableObject {
 @main
 struct PrivateNASApp: App {
     @StateObject private var drive = Drive()
+    @StateObject private var transfers = TransferCenter()
 
     var body: some Scene {
         WindowGroup {
@@ -280,6 +253,7 @@ struct PrivateNASApp: App {
                 LoginView(drive: drive)
             } else {
                 NavigationStack { FolderView(drive: drive, path: []) }
+                    .environmentObject(transfers)
             }
         }
     }
@@ -290,7 +264,6 @@ private struct ServerProfile: Codable, Identifiable {
     var name = ""
     var address = ""
     var username = ""
-    var fingerprint = ""
 
     static let home = ServerProfile(
         id: UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)),
@@ -314,7 +287,6 @@ private struct ServerProfile: Codable, Identifiable {
               isLegacyHome || normalizedAddress == Self.home.address else { return self }
         var updated = self
         updated.address = Self.home.address
-        updated.fingerprint = ""
         return updated
     }
 }
@@ -424,7 +396,7 @@ private struct LoginView: View {
             Task {
                 defer { connecting = nil }
                 do {
-                    try await drive.login(address: profile.address, fingerprint: profile.fingerprint,
+                    try await drive.login(address: profile.address,
                                           username: profile.username, password: password)
                 } catch { self.error = "\(error.localizedDescription)  如需更新密码，请长按服务器并选择「编辑服务器」。" }
             }
@@ -446,8 +418,7 @@ private struct LoginView: View {
               let address = UserDefaults.standard.string(forKey: "serverAddress"), !address.isEmpty,
               address != ServerProfile.home.address else { return }
         let profile = ServerProfile(name: "之前的服务器", address: address,
-                                    username: UserDefaults.standard.string(forKey: "ownerName") ?? "",
-                                    fingerprint: UserDefaults.standard.string(forKey: "serverFingerprint") ?? "")
+                                    username: UserDefaults.standard.string(forKey: "ownerName") ?? "")
         guard !profile.isLegacyHome else { return }
         try? save(profile, password: "")
     }
@@ -481,8 +452,6 @@ private struct ServerEditor: View {
                         TextField("名称", text: $profile.name)
                         TextField("https://服务器地址:8787", text: $profile.address)
                             .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
-                        TextField("自签名证书 SHA-256 指纹", text: $profile.fingerprint)
-                            .textInputAutocapitalization(.never).autocorrectionDisabled()
                         TextField("用户名", text: $profile.username)
                             .textContentType(.username).textInputAutocapitalization(.never).autocorrectionDisabled()
                     }
@@ -512,20 +481,14 @@ private struct ServerEditor: View {
             profile.name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
             profile.address = profile.address.trimmingCharacters(in: .whitespacesAndNewlines)
             profile.username = profile.username.trimmingCharacters(in: .whitespacesAndNewlines)
-            profile.fingerprint = profile.fingerprint.filter { !$0.isWhitespace && $0 != ":" }.lowercased()
             guard !profile.name.isEmpty, !profile.username.isEmpty,
                   let url = URL(string: profile.address), url.scheme?.lowercased() == "https", url.host != nil,
                   url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
                   url.path.isEmpty || url.path == "/" else {
                 throw APIError(message: "请填写名称、HTTPS 地址和用户名。")
             }
-            guard profile.fingerprint.isEmpty ||
-                    profile.fingerprint.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil else {
-                throw APIError(message: "证书指纹应为 64 个十六进制字符。")
-            }
             let original = request.profile
-            let connectionChanged = profile.address != original.address || profile.username != original.username ||
-                profile.fingerprint != original.fingerprint.lowercased()
+            let connectionChanged = profile.address != original.address || profile.username != original.username
             if password.isEmpty {
                 guard !connectionChanged else { throw APIError(message: "请输入网盘密码。") }
                 guard try ServerPasswords.read(for: profile.id) != nil else {
@@ -541,11 +504,15 @@ private struct ServerEditor: View {
 
 private struct FolderView: View {
     @ObservedObject var drive: Drive
+    @EnvironmentObject private var transfers: TransferCenter
     let path: [String]
     @State private var entries: [Entry] = []
     @State private var query = ""
     @State private var importing = false
+    @State private var uploadingFolder = false
     @State private var pendingDownload: Entry?
+    @State private var showingTransfers = false
+    @State private var transferDirection: TransferJob.Direction = .upload
     @State private var pickingPhotos = false
     @State private var photos: [PhotosPickerItem] = []
     @State private var transferStatus: String?
@@ -615,6 +582,11 @@ private struct FolderView: View {
         .sheet(item: $export, onDismiss: clearPreview) { item in
             FilePreview(file: item.url)
         }
+        .sheet(isPresented: $showingTransfers, onDismiss: {
+            Task { await refresh() }
+        }) {
+            TransferPanel(transfers: transfers, drive: drive, direction: transferDirection)
+        }
     }
 
     private var fileList: some View {
@@ -634,13 +606,11 @@ private struct FolderView: View {
             }
             .swipeActions(allowsFullSwipe: false) { deleteButton(entry) }
             .swipeActions(edge: .leading, allowsFullSwipe: false) {
-                if !entry.directory {
-                    Button { chooseDownloadLocation(entry) } label: {
-                        Label("下载", systemImage: "arrow.down.to.line")
-                    }
-                    .tint(.blue)
-                    .disabled(busy)
+                Button { chooseDownloadLocation(entry) } label: {
+                    Label("下载", systemImage: "arrow.down.to.line")
                 }
+                .tint(.blue)
+                .disabled(busy)
             }
             .contextMenu { itemActions(entry) }
         }
@@ -662,7 +632,7 @@ private struct FolderView: View {
             photos = []
             run { await uploadPhotos(selection) }
         }
-        .fileImporter(isPresented: $importing, allowedContentTypes: pendingDownload == nil ? [.item] : [.folder],
+        .fileImporter(isPresented: $importing, allowedContentTypes: pendingDownload != nil || uploadingFolder ? [.folder] : [.item],
                       onCompletion: finishPickingLocation)
     }
 
@@ -691,21 +661,22 @@ private struct FolderView: View {
         run {
             let location = try result.get()
             if let entry = downloadEntry {
-                transferStatus = "正在下载 \(entry.name)"
-                _ = try await drive.download(path + [entry.name], into: location)
-                transferResult = "已将「\(entry.name)」保存到「\(location.lastPathComponent)」。"
+                transferStatus = "正在准备下载…"
+                try await transfers.enqueueDownload(entry, at: path, into: location, drive: drive)
+                openTransfers(.download)
             } else {
-                transferStatus = "正在上传 \(location.lastPathComponent)"
-                try await drive.upload(location, to: path)
-                entries = try await drive.list(path)
-                transferResult = "已上传 \(location.lastPathComponent)"
+                transferStatus = "正在准备上传…"
+                try await transfers.enqueueUpload(location, to: path, drive: drive)
+                openTransfers(.upload)
             }
         }
     }
 
     @ViewBuilder
     private func fileActions(_ entry: Entry) -> some View {
-        Button { openPreview(entry) } label: { Label("预览", systemImage: "eye") }
+        if !entry.directory {
+            Button { openPreview(entry) } label: { Label("预览", systemImage: "eye") }
+        }
         Button { chooseDownloadLocation(entry) } label: {
             Label("下载并选择保存位置", systemImage: "arrow.down.to.line")
         }
@@ -713,7 +684,7 @@ private struct FolderView: View {
 
     @ViewBuilder
     private func itemActions(_ entry: Entry) -> some View {
-        if !entry.directory { fileActions(entry).disabled(busy) }
+        fileActions(entry).disabled(busy)
         Button { drive.clipboard = ClipboardItem(path: path + [entry.name], move: false) } label: {
             Label("复制", systemImage: "document.on.document")
         }
@@ -781,12 +752,20 @@ private struct FolderView: View {
     @ToolbarContentBuilder
     private var fileToolbar: some ToolbarContent {
         ToolbarItem(placement: .navigationBarTrailing) {
+            Button { openTransfers(transferDirection) } label: {
+                Label("传输", systemImage: "arrow.up.arrow.down.circle")
+            }
+        }
+        ToolbarItem(placement: .navigationBarTrailing) {
             Menu {
                 Button { pickingPhotos = true } label: {
                     Label("上传照片和视频", systemImage: "photo.on.rectangle.angled")
                 }
-                Button { pendingDownload = nil; importing = true } label: {
+                Button { pendingDownload = nil; uploadingFolder = false; importing = true } label: {
                     Label("上传文件", systemImage: "square.and.arrow.up")
+                }
+                Button { pendingDownload = nil; uploadingFolder = true; importing = true } label: {
+                    Label("上传文件夹", systemImage: "folder.badge.plus")
                 }
             } label: {
                 Label("上传", systemImage: "plus.circle.fill")
@@ -813,6 +792,11 @@ private struct FolderView: View {
         }
     }
 
+    private func openTransfers(_ direction: TransferJob.Direction) {
+        transferDirection = direction
+        showingTransfers = true
+    }
+
     private func row(_ entry: Entry) -> some View {
         HStack(spacing: 12) {
             FileThumbnail(drive: drive, entry: entry, path: path + [entry.name])
@@ -831,26 +815,23 @@ private struct FolderView: View {
         var uploaded = 0
         var firstFailure: String?
         for (index, item) in selection.enumerated() {
-            transferStatus = "正在上传相册项目 \(index + 1) / \(selection.count)"
+            transferStatus = "正在准备相册项目 \(index + 1) / \(selection.count)"
             do {
                 guard let photo = try await item.loadTransferable(type: PhotoFile.self) else {
                     throw APIError(message: "无法读取所选照片或视频")
                 }
                 defer { try? FileManager.default.removeItem(at: photo.url.deletingLastPathComponent()) }
-                try await drive.upload(photo.url, to: path)
+                try await transfers.enqueueUpload(photo.url, to: path, drive: drive, importPhoto: true)
                 uploaded += 1
             } catch {
                 firstFailure = firstFailure ?? error.localizedDescription
                 if drive.token == nil { break }
             }
         }
-        if drive.token != nil {
-            do { entries = try await drive.list(path) }
-            catch { firstFailure = firstFailure ?? error.localizedDescription }
-        }
-        var result = "已上传 \(uploaded) / \(selection.count) 个项目。"
+        if uploaded > 0 { openTransfers(.upload) }
+        var result = "已添加 \(uploaded) / \(selection.count) 个传输任务。"
         if let firstFailure { result += "\n\(firstFailure)" }
-        transferResult = result
+        if firstFailure != nil { transferResult = result }
     }
 
     private func refresh() async {

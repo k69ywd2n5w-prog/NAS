@@ -3,7 +3,7 @@ import https from 'node:https';
 import { constants, createWriteStream } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
-import { randomBytes, scrypt as derive, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, scrypt as derive, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
@@ -17,6 +17,7 @@ const rootSetting = path.join(configDir, 'storage-root.txt');
 const storage = process.env.NAS_ROOT || 'E:\\PrivateNAS';
 const port = Number(process.env.NAS_PORT || 8787);
 const uploadLimit = 20 * 1024 ** 3;
+const chunkLimit = 1024 * 1024;
 const internalPrefix = '.nas-upload-';
 const fail = (status, message) => Object.assign(new Error(message), { status });
 
@@ -58,6 +59,71 @@ async function serve() {
   const sessionLifetime = 12 * 60 * 60 * 1000;
   let failures = [];
   let loginInProgress = false;
+  const activeUploads = new Set();
+
+  function integer(value, max) {
+    if (value === null || !/^\d+$/.test(value) || Number(value) > max) throw fail(400, '传输参数无效');
+    return Number(value);
+  }
+
+  async function uploadChunk(req, res, parent, destination, query) {
+    const id = query.get('id');
+    if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id || '')) {
+      throw fail(400, '传输编号无效');
+    }
+    const size = integer(query.get('size'), uploadLimit);
+    const key = createHash('sha256').update(id.toLowerCase() + ':' + destination.toLowerCase()).digest('hex');
+    const partial = path.join(parent, internalPrefix + key);
+    if (activeUploads.has(partial)) throw fail(409, '上传正在处理中，请重试');
+    activeUploads.add(partial);
+    try {
+      const info = await fs.lstat(partial).catch(error => {
+        if (error.code !== 'ENOENT') throw error;
+      });
+      if (info && (!info.isFile() || info.size > size)) throw fail(409, '上传记录与文件不一致');
+      if (req.method === 'DELETE') {
+        await fs.rm(partial, { force: true });
+        return json(res, 200, { ok: true });
+      }
+      const existing = await fs.lstat(destination, { bigint: true }).catch(error => {
+        if (error.code !== 'ENOENT') throw error;
+      });
+      if (existing) {
+        const pending = info && await fs.lstat(partial, { bigint: true });
+        if (pending && existing.isFile() && existing.ino === pending.ino && existing.dev === pending.dev &&
+            existing.size === BigInt(size)) return json(res, 200, { offset: size, finished: true });
+        throw fail(409, '目标位置已有同名文件');
+      }
+      const offset = info?.size ?? 0;
+      if (req.method === 'GET') return json(res, 200, { offset, finished: false });
+      if (req.method === 'POST') {
+        if (offset !== size) throw fail(409, '文件尚未完整上传');
+        if (!info) await fs.writeFile(partial, '', { flag: 'wx' });
+        await fs.link(partial, destination);
+        return json(res, 201, { offset, finished: true });
+      }
+      if (integer(query.get('offset'), size) !== offset) throw fail(409, '续传位置已变化，请重试');
+      const chunks = [];
+      let length = 0;
+      for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+        length += chunk.length;
+        if (length > Math.min(chunkLimit, size - offset)) throw fail(413, '传输块大小无效');
+        chunks.push(chunk);
+      }
+      if (!length) throw fail(400, '传输块为空');
+      const handle = await fs.open(partial, info ? 'r+' : 'wx');
+      try {
+        const bytes = Buffer.concat(chunks);
+        let written = 0;
+        while (written < length) {
+          const result = await handle.write(bytes, written, length - written, offset + written);
+          if (!result.bytesWritten) throw fail(507, '无法写入上传数据');
+          written += result.bytesWritten;
+        }
+      } finally { await handle.close(); }
+      return json(res, 200, { offset: offset + length, finished: false });
+    } finally { activeUploads.delete(partial); }
+  }
 
   // Resolve each existing component and reject links, including Windows junctions.
   function contains(parent, child) {
@@ -221,6 +287,9 @@ async function serve() {
       sessions.delete(token);
       throw fail(401, '网盘目录已切换，请重新登录');
     }
+    if (route === 'GET /api/transfer-root') {
+      return json(res, 200, { id: createHash('sha256').update(root.toLowerCase()).digest('hex') });
+    }
     if (route === 'GET /api/files') {
       const folder = await resolve(root, names);
       const files = [];
@@ -240,6 +309,25 @@ async function serve() {
     if (route === 'POST /api/copy' || route === 'POST /api/move') {
       await transfer(root, route, names, parts(url.searchParams.get('destination')));
       return json(res, 200, { ok: true });
+    }
+    if (route === 'GET /api/download-chunk') {
+      const destination = await resolve(root, names);
+      if (!(await fs.lstat(destination)).isFile()) throw fail(400, '请选择文件');
+      const file = await fs.open(destination, 'r');
+      try {
+        const info = await file.stat();
+        if (url.searchParams.get('modified') === null || url.searchParams.get('size') === null ||
+            Number(url.searchParams.get('size')) !== info.size ||
+            Number(url.searchParams.get('modified')) !== info.mtimeMs) {
+          throw fail(409, '服务器文件已变更，请重新添加下载任务');
+        }
+        const offset = integer(url.searchParams.get('offset'), info.size);
+        const buffer = Buffer.allocUnsafe(Math.min(chunkLimit, info.size - offset));
+        const { bytesRead } = buffer.length ? await file.read(buffer, 0, buffer.length, offset) : { bytesRead: 0 };
+        if (buffer.length && !bytesRead) throw fail(409, '服务器文件已变更，请重新添加下载任务');
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': bytesRead });
+        return res.end(buffer.subarray(0, bytesRead));
+      } finally { await file.close(); }
     }
     if (route === 'GET /api/file') {
       const destination = await resolve(root, names);
@@ -282,6 +370,9 @@ async function serve() {
     }
     const parent = await resolve(root, names.slice(0, -1));
     const destination = path.join(parent, names.at(-1));
+    if (url.pathname === '/api/upload-chunk' && ['GET', 'PUT', 'POST', 'DELETE'].includes(req.method)) {
+      return uploadChunk(req, res, parent, destination, url.searchParams);
+    }
     if (route === 'POST /api/folder') {
       await fs.mkdir(destination);
       return json(res, 201, { ok: true });
