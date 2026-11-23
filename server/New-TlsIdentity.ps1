@@ -1,7 +1,10 @@
 # Requires PowerShell 7 for its bundled .NET cryptography APIs.
-param([Parameter(Mandatory)][string]$ServerName)
+param(
+    [Parameter(Mandatory)][string[]]$ServerName,
+    [string]$OutputDirectory = (Join-Path $env:LOCALAPPDATA 'PrivateNAS')
+)
 $ErrorActionPreference = 'Stop'
-$folder = Join-Path $env:LOCALAPPDATA 'PrivateNAS'
+$folder = $OutputDirectory
 $certPath = Join-Path $folder 'server-cert.pem'
 $keyPath = Join-Path $folder 'server-key.pem'
 if ((Test-Path $certPath) -or (Test-Path $keyPath)) { throw 'A TLS identity already exists.' }
@@ -11,9 +14,11 @@ try {
         'CN=PrivateNAS', $rsa, [Security.Cryptography.HashAlgorithmName]::SHA256,
         [Security.Cryptography.RSASignaturePadding]::Pkcs1)
     $san = [Security.Cryptography.X509Certificates.SubjectAlternativeNameBuilder]::new()
-    $address = $null
-    if ([Net.IPAddress]::TryParse($ServerName, [ref]$address)) { $san.AddIpAddress($address) }
-    else { $san.AddDnsName($ServerName) }
+    foreach ($name in $ServerName) {
+        $address = $null
+        if ([Net.IPAddress]::TryParse($name, [ref]$address)) { $san.AddIpAddress($address) }
+        else { $san.AddDnsName($name) }
+    }
     $request.CertificateExtensions.Add($san.Build())
     $usages = [Security.Cryptography.OidCollection]::new()
     [void]$usages.Add([Security.Cryptography.Oid]::new('1.3.6.1.5.5.7.3.1'))
