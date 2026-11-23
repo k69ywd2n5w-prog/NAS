@@ -294,8 +294,29 @@ private struct ServerProfile: Codable, Identifiable {
 
     static let home = ServerProfile(
         id: UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)),
-        name: "家庭网盘", address: "https://192.168.0.111:8787", username: "chenzheng",
-        fingerprint: "7F750F97D5F2346542CCBAB63B945C1C39792DCF220C1926F91FDCFD20F9AB4C")
+        name: "家庭网盘", address: "https://desktop-evd50fu.tail5100bc.ts.net", username: "chenzheng")
+
+    private static let legacyHomeAddresses = [
+        "https://192.168.0.111:8787",
+        "https://100.117.28.50:8787",
+    ]
+
+    private var normalizedAddress: String {
+        address.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    var isLegacyHome: Bool {
+        username == Self.home.username && Self.legacyHomeAddresses.contains(normalizedAddress)
+    }
+
+    var updatedHomeProfile: Self {
+        guard id == Self.home.id, username == Self.home.username,
+              isLegacyHome || normalizedAddress == Self.home.address else { return self }
+        var updated = self
+        updated.address = Self.home.address
+        updated.fingerprint = ""
+        return updated
+    }
 }
 
 private enum ServerPasswords {
@@ -337,12 +358,14 @@ private enum ServerPasswords {
 private struct LoginView: View {
     @ObservedObject var drive: Drive
     @AppStorage("serverProfiles") private var storedProfiles = Data()
+    @AppStorage("didMigrateHomeToTailscale") private var didMigrateHomeToTailscale = false
     @State private var editor: ServerEditorRequest?
     @State private var error = ""
     @State private var connecting: UUID?
 
     private var profiles: [ServerProfile] {
-        (try? JSONDecoder().decode([ServerProfile].self, from: storedProfiles)) ?? [.home]
+        let saved = (try? JSONDecoder().decode([ServerProfile].self, from: storedProfiles)) ?? [.home]
+        return didMigrateHomeToTailscale ? saved : saved.map(\.updatedHomeProfile)
     }
 
     var body: some View {
@@ -379,7 +402,13 @@ private struct LoginView: View {
                     if request.passwordOnly { connect(profile) }
                 }
             }
-            .onAppear(perform: migratePreviousServer)
+            .onAppear {
+                migratePreviousServer()
+                if !didMigrateHomeToTailscale, let data = try? JSONEncoder().encode(profiles) {
+                    storedProfiles = data
+                    didMigrateHomeToTailscale = true
+                }
+            }
         }
     }
 
@@ -419,6 +448,7 @@ private struct LoginView: View {
         let profile = ServerProfile(name: "之前的服务器", address: address,
                                     username: UserDefaults.standard.string(forKey: "ownerName") ?? "",
                                     fingerprint: UserDefaults.standard.string(forKey: "serverFingerprint") ?? "")
+        guard !profile.isLegacyHome else { return }
         try? save(profile, password: "")
     }
 }

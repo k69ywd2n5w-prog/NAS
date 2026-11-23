@@ -28,7 +28,7 @@ Windows 服务端把文件保存在 `E:\PrivateNAS`。iPhone 客户端支持账�
 
 用 Mac 上的 Xcode 打开 `ios/PrivateNAS.xcodeproj`，在目标的 **Signing & Capabilities** 中选择自己的签名团队并运行到 iOS 17 或更新版本的 iPhone。如果签名提示 Bundle Identifier 冲突，可换成自己的标识。
 
-先让手机连接家里 Wi‑Fi，在登录首页点「家庭网盘」。首次只需输入已设置的网盘密码。之后密码保存在该 iPhone 的钥匙串中，点服务器即可连接。长按服务器可编辑配置或更新密码。
+先在 iPhone 上连接 Tailscale，再在登录首页点「家庭网盘」。默认地址是 `https://desktop-evd50fu.tail5100bc.ts.net`，由 iOS 验证 HTTPS 证书。首次只需输入已设置的网盘密码。之后密码保存在该 iPhone 的钥匙串中，点服务器即可连接。已有家庭网盘配置会自动切换到此地址并复用钥匙串密码。长按服务器可编辑配置或更新密码。
 
 通过「新增服务器」填写服务器名称、HTTPS 地址、用户名和密码。使用受系统信任的证书时可留空指纹。使用自签名证书时，App 按指纹校验服务器身份，同一张证书可以用于局域网和公网两个地址。更换证书后从 Windows 重新确认指纹。
 
